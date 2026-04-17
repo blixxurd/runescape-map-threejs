@@ -1,0 +1,13 @@
+{
+  "name": "runescape-map-threejs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "extract": "pnpm --filter @rsmap/extractor run extract",
+    "dev": "pnpm --filter @rsmap/viewer run dev",
+    "build": "pnpm --filter @rsmap/viewer run build",
+    "typecheck": "pnpm -r run typecheck"
+  }
+}

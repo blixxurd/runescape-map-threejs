@@ -1,0 +1,6 @@
+node_modules/
+.cache/
+dist/
+.DS_Store
+*.log
+packages/viewer/public/regions/
