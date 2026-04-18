@@ -12,7 +12,8 @@
     "osrscachereader": "^1.1.3",
     "sade": "^1.8.1",
     "fflate": "^0.8.2",
-    "lodash": "^4.17.21"
+    "lodash": "^4.17.21",
+    "canvas": "^3.2.3"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

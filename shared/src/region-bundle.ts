@@ -35,7 +35,7 @@ export interface RegionBundle {
  * the per-triangle flat shading intent.
  */
 export interface TerrainMeta {
-  schemaVersion: 1;
+  schemaVersion: 2;
   regionId: number;
   regionX: number;
   regionZ: number;
@@ -49,15 +49,18 @@ export interface TerrainMeta {
     vertexCount: number;
     positionsByteOffset: number;
     colorsByteOffset: number;
+    uvsByteOffset: number;
   }>;
   /** Total vertex count across all planes (positions array length / 3). */
   totalVertexCount: number;
-  /** Byte lengths of the two flat attribute blobs. */
+  /** Byte lengths of the flat attribute blobs. */
   positionsByteLength: number;
   colorsByteLength: number;
+  uvsByteLength: number;
   /** File names relative to the bundle root. */
   positionsFile: string; // "terrain.pos.bin"  — Float32 [x,y,z] × totalVertexCount
   colorsFile: string; // "terrain.col.bin"    — Uint8   [r,g,b,a] × totalVertexCount
+  uvsFile: string; // "terrain.uv.bin"        — Float32 [u,v] × totalVertexCount
   /**
    * Grid of corner heights in world-Y (already flipped: +Y up).
    * Layout: plane-major Int16 (4 × 65 × 65). The viewer uses this to place
@@ -65,6 +68,26 @@ export interface TerrainMeta {
    */
   heightsFile: string; // "terrain.heights.bin"
   heightsByteLength: number;
+}
+
+/**
+ * Shared texture atlas for overlay/loc textures. Cells are the same size and
+ * arranged in a square grid so UVs are simple: `u ∈ [cellU, cellU+cellSize]`.
+ *
+ * A special "solid" cell (always at grid index 0) is a single-color white
+ * texture used by all vertices that don't have an overlay texture — the
+ * vertex color fully drives their appearance.
+ */
+export interface TextureAtlas {
+  schemaVersion: 1;
+  atlasFile: string; // "atlas.png"
+  atlasSize: number; // pixels square
+  cellSize: number; // pixels square
+  cellsPerRow: number;
+  /** Map from OSRS texture ID → cell index (0..cellsPerRow²). Cell 0 is white. */
+  cellByTextureId: Record<number, number>;
+  /** Inverse: grid index → texture id (−1 for the white cell and empty cells). */
+  textureIdByCell: number[];
 }
 
 // ---------- Locs ----------
@@ -89,6 +112,7 @@ export interface LocBlock {
   vertexCount: number;
   positionsByteOffset: number;
   colorsByteOffset: number;
+  uvsByteOffset: number;
   bboxMin: [number, number, number];
   bboxMax: [number, number, number];
 }
@@ -114,13 +138,15 @@ export interface LocPlacement {
 }
 
 export interface LocsManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   blocks: LocBlock[];
   placements: LocPlacement[];
   positionsByteLength: number;
   colorsByteLength: number;
+  uvsByteLength: number;
   positionsFile: string; // "locs.pos.bin"
   colorsFile: string; // "locs.col.bin"
+  uvsFile: string; // "locs.uv.bin"
   /** loc ids that appeared in placements but could not be resolved (missing from cache). */
   skippedLocIds: number[];
 }

@@ -13,6 +13,9 @@ importers:
       '@rsmap/shared':
         specifier: workspace:*
         version: link:../../shared
+      canvas:
+        specifier: ^3.2.3
+        version: 3.2.3
       fflate:
         specifier: ^0.8.2
         version: 0.8.2

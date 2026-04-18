@@ -61,12 +61,26 @@ export const TILE_SHAPE_FACES: readonly (readonly number[])[] = [
  */
 export type Rgb = readonly [number, number, number];
 
+/**
+ * Per-corner colors. Both underlay and overlay are now 4-tuple — the OSRS
+ * client applies per-corner lighting (`mixLightness(hsl, cornerLight)`),
+ * giving each of SW/SE/NE/NW its own RGB. Midpoint and quarter-point
+ * vertices defined by the shape table are computed by averaging adjacent
+ * corner RGBs.
+ *
+ * `null` at any corner means "no underlay/overlay for that corner" (either
+ * because the tile has no underlay/overlay at all, or, in future multi-region
+ * work, because a neighbor hasn't loaded yet).
+ */
 export interface CornerColors {
   underlaySw: Rgb | null;
   underlaySe: Rgb | null;
   underlayNe: Rgb | null;
   underlayNw: Rgb | null;
-  overlay: Rgb | null; // flat — same at all corners
+  overlaySw: Rgb | null;
+  overlaySe: Rgb | null;
+  overlayNe: Rgb | null;
+  overlayNw: Rgb | null;
 }
 
 /** Heights at tile corners (in world-Y units; already × 8 by getHeights()). */
@@ -80,6 +94,30 @@ export interface CornerHeights {
 export interface TriangleSoupOut {
   positions: number[]; // [x, y, z, x, y, z, ...]
   colors: number[]; // [r, g, b, a, r, g, b, a, ...], all 0..255
+  uvs: number[]; // [u, v, u, v, ...]
+}
+
+/**
+ * Atlas params threaded through to compute per-vertex UVs. `underlayCell` is
+ * the atlas cell for underlay triangles (typically 0, the white cell — the
+ * vertex color drives appearance). `overlayCell` is the cell for this tile's
+ * overlay texture, or `underlayCell` when the overlay is a flat color.
+ */
+export interface TileAtlasInfo {
+  cellsPerRow: number;
+  atlasSize: number;
+  underlayCell: number;
+  overlayCell: number;
+}
+
+function cellUV(info: TileAtlasInfo, cell: number, u: number, v: number): [number, number] {
+  const cellU = cell % info.cellsPerRow;
+  const cellV = Math.floor(cell / info.cellsPerRow);
+  const cellFrac = 1 / info.cellsPerRow;
+  const inset = 0.5 / info.atlasSize;
+  const uu = cellU * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, u));
+  const vv = cellV * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, v));
+  return [uu, vv];
 }
 
 /** Midpoint mix — simple RGB average. */
@@ -107,11 +145,16 @@ export function emitTileTriangles(
   rotation: number,
   heights: CornerHeights,
   colors: CornerColors,
+  atlas: TileAtlasInfo,
   out: TriangleSoupOut,
 ): void {
   const vertexIndices = TILE_SHAPE_VERTEX_INDICES[shape] ?? TILE_SHAPE_VERTEX_INDICES[0]!;
   const faceTable = TILE_SHAPE_FACES[shape] ?? TILE_SHAPE_FACES[0]!;
-  const hasOverlay = colors.overlay !== null;
+  const hasOverlay =
+    colors.overlaySw !== null ||
+    colors.overlaySe !== null ||
+    colors.overlayNe !== null ||
+    colors.overlayNw !== null;
 
   const tileWx = tileX * TILE_SIZE;
   // Internal tile-local Z goes SW→NE (south at low Z, north at high Z)
@@ -124,8 +167,11 @@ export function emitTileTriangles(
   const vx = new Array<number>(n);
   const vy = new Array<number>(n);
   const vz = new Array<number>(n);
+  /** Tile-local UV (0..1 within the tile); atlas mapping is per-face later. */
+  const vu = new Array<number>(n);
+  const vvv = new Array<number>(n);
   const vUnder = new Array<Rgb>(n);
-  const vOver: Rgb = colors.overlay ?? GREY;
+  const vOver = new Array<Rgb>(n);
 
   for (let i = 0; i < n; i++) {
     let vi = vertexIndices[i]!;
@@ -141,103 +187,88 @@ export function emitTileTriangles(
     let pz = 0;
     let py = 0;
     let underRgb: Rgb = GREY;
+    let overRgb: Rgb = GREY;
 
     switch (vi) {
       case 1: // SW corner
-        px = tileWx;
-        pz = tileWz;
-        py = heights.sw;
+        px = tileWx; pz = tileWz; py = heights.sw;
         underRgb = colors.underlaySw ?? GREY;
+        overRgb = colors.overlaySw ?? GREY;
         break;
       case 2: // S midpoint
-        px = tileWx + HALF;
-        pz = tileWz;
-        py = (heights.se + heights.sw) >> 1;
+        px = tileWx + HALF; pz = tileWz; py = (heights.se + heights.sw) >> 1;
         underRgb = midRgb(colors.underlaySw, colors.underlaySe, GREY);
+        overRgb = midRgb(colors.overlaySw, colors.overlaySe, GREY);
         break;
       case 3: // SE
-        px = tileWx + TILE_SIZE;
-        pz = tileWz;
-        py = heights.se;
+        px = tileWx + TILE_SIZE; pz = tileWz; py = heights.se;
         underRgb = colors.underlaySe ?? GREY;
+        overRgb = colors.overlaySe ?? GREY;
         break;
       case 4: // E mid
-        px = tileWx + TILE_SIZE;
-        pz = tileWz + HALF;
-        py = (heights.ne + heights.se) >> 1;
+        px = tileWx + TILE_SIZE; pz = tileWz + HALF; py = (heights.ne + heights.se) >> 1;
         underRgb = midRgb(colors.underlaySe, colors.underlayNe, GREY);
+        overRgb = midRgb(colors.overlaySe, colors.overlayNe, GREY);
         break;
       case 5: // NE
-        px = tileWx + TILE_SIZE;
-        pz = tileWz + TILE_SIZE;
-        py = heights.ne;
+        px = tileWx + TILE_SIZE; pz = tileWz + TILE_SIZE; py = heights.ne;
         underRgb = colors.underlayNe ?? GREY;
+        overRgb = colors.overlayNe ?? GREY;
         break;
       case 6: // N mid
-        px = tileWx + HALF;
-        pz = tileWz + TILE_SIZE;
-        py = (heights.ne + heights.nw) >> 1;
+        px = tileWx + HALF; pz = tileWz + TILE_SIZE; py = (heights.ne + heights.nw) >> 1;
         underRgb = midRgb(colors.underlayNe, colors.underlayNw, GREY);
+        overRgb = midRgb(colors.overlayNe, colors.overlayNw, GREY);
         break;
       case 7: // NW
-        px = tileWx;
-        pz = tileWz + TILE_SIZE;
-        py = heights.nw;
+        px = tileWx; pz = tileWz + TILE_SIZE; py = heights.nw;
         underRgb = colors.underlayNw ?? GREY;
+        overRgb = colors.overlayNw ?? GREY;
         break;
       case 8: // W mid
-        px = tileWx;
-        pz = tileWz + HALF;
-        py = (heights.nw + heights.sw) >> 1;
+        px = tileWx; pz = tileWz + HALF; py = (heights.nw + heights.sw) >> 1;
         underRgb = midRgb(colors.underlayNw, colors.underlaySw, GREY);
+        overRgb = midRgb(colors.overlayNw, colors.overlaySw, GREY);
         break;
       case 9:
-        px = tileWx + HALF;
-        pz = tileWz + QUARTER;
-        py = (heights.se + heights.sw) >> 1;
+        px = tileWx + HALF; pz = tileWz + QUARTER; py = (heights.se + heights.sw) >> 1;
         underRgb = midRgb(colors.underlaySw, colors.underlaySe, GREY);
+        overRgb = midRgb(colors.overlaySw, colors.overlaySe, GREY);
         break;
       case 10:
-        px = tileWx + THREE_QTR;
-        pz = tileWz + HALF;
-        py = (heights.ne + heights.se) >> 1;
+        px = tileWx + THREE_QTR; pz = tileWz + HALF; py = (heights.ne + heights.se) >> 1;
         underRgb = midRgb(colors.underlaySe, colors.underlayNe, GREY);
+        overRgb = midRgb(colors.overlaySe, colors.overlayNe, GREY);
         break;
       case 11:
-        px = tileWx + HALF;
-        pz = tileWz + THREE_QTR;
-        py = (heights.ne + heights.nw) >> 1;
+        px = tileWx + HALF; pz = tileWz + THREE_QTR; py = (heights.ne + heights.nw) >> 1;
         underRgb = midRgb(colors.underlayNe, colors.underlayNw, GREY);
+        overRgb = midRgb(colors.overlayNe, colors.overlayNw, GREY);
         break;
       case 12:
-        px = tileWx + QUARTER;
-        pz = tileWz + HALF;
-        py = (heights.nw + heights.sw) >> 1;
+        px = tileWx + QUARTER; pz = tileWz + HALF; py = (heights.nw + heights.sw) >> 1;
         underRgb = midRgb(colors.underlayNw, colors.underlaySw, GREY);
+        overRgb = midRgb(colors.overlayNw, colors.overlaySw, GREY);
         break;
       case 13:
-        px = tileWx + QUARTER;
-        pz = tileWz + QUARTER;
-        py = heights.sw;
+        px = tileWx + QUARTER; pz = tileWz + QUARTER; py = heights.sw;
         underRgb = colors.underlaySw ?? GREY;
+        overRgb = colors.overlaySw ?? GREY;
         break;
       case 14:
-        px = tileWx + THREE_QTR;
-        pz = tileWz + QUARTER;
-        py = heights.se;
+        px = tileWx + THREE_QTR; pz = tileWz + QUARTER; py = heights.se;
         underRgb = colors.underlaySe ?? GREY;
+        overRgb = colors.overlaySe ?? GREY;
         break;
       case 15:
-        px = tileWx + THREE_QTR;
-        pz = tileWz + THREE_QTR;
-        py = heights.ne;
+        px = tileWx + THREE_QTR; pz = tileWz + THREE_QTR; py = heights.ne;
         underRgb = colors.underlayNe ?? GREY;
+        overRgb = colors.overlayNe ?? GREY;
         break;
       default: // 16
-        px = tileWx + QUARTER;
-        pz = tileWz + THREE_QTR;
-        py = heights.nw;
+        px = tileWx + QUARTER; pz = tileWz + THREE_QTR; py = heights.nw;
         underRgb = colors.underlayNw ?? GREY;
+        overRgb = colors.overlayNw ?? GREY;
         break;
     }
 
@@ -248,7 +279,12 @@ export function emitTileTriangles(
     // inverts the landscape (rivers become ridges).
     vy[i] = py;
     vz[i] = pz;
+    // Tile-local UVs in [0, 1]. Computed before the Z flip so textures
+    // tile once per (128×128) tile regardless of our world convention.
+    vu[i] = (px - tileWx) / TILE_SIZE;
+    vvv[i] = (pz - tileWz) / TILE_SIZE;
     vUnder[i] = underRgb;
+    vOver[i] = overRgb;
   }
 
   const hasAnyUnderlay =
@@ -269,9 +305,17 @@ export function emitTileTriangles(
     // Skip fully void tiles (no underlay, no overlay).
     if (!isOverlayFace && !hasAnyUnderlay && !hasOverlay) continue;
 
-    const rgbA = isOverlayFace ? vOver : vUnder[a]!;
-    const rgbB = isOverlayFace ? vOver : vUnder[b]!;
-    const rgbC = isOverlayFace ? vOver : vUnder[c]!;
+    const rgbA = isOverlayFace ? vOver[a]! : vUnder[a]!;
+    const rgbB = isOverlayFace ? vOver[b]! : vUnder[b]!;
+    const rgbC = isOverlayFace ? vOver[c]! : vUnder[c]!;
+
+    // Atlas cell: overlay faces sample the overlay's texture (or white if
+    // the overlay is color-only); underlay faces always sample white so the
+    // blended vertex color comes through.
+    const cell = isOverlayFace ? atlas.overlayCell : atlas.underlayCell;
+    const [uA, vA] = cellUV(atlas, cell, vu[a]!, vvv[a]!);
+    const [uB, vB] = cellUV(atlas, cell, vu[b]!, vvv[b]!);
+    const [uC, vC] = cellUV(atlas, cell, vu[c]!, vvv[c]!);
 
     // Coordinate conversion at output:
     //   - Y already flipped during per-vertex compute (heights positive-up).
@@ -289,5 +333,6 @@ export function emitTileTriangles(
       rgbB[0], rgbB[1], rgbB[2], 255,
       rgbC[0], rgbC[1], rgbC[2], 255,
     );
+    out.uvs.push(uA, vA, uB, vB, uC, vC);
   }
 }

@@ -5,6 +5,13 @@ import { loadRegion } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs } from "./locs/placeLocs.js";
 
+// Match OSRS's sRGB-passthrough convention — the original client never did
+// gamma/linear-space conversions. With Three's default color management on,
+// our sRGB-authored vertex colors would be treated as linear, re-encoded
+// to sRGB on output, and appear washed-out yellow. Disabling puts every
+// byte in "what you send is what you display" mode.
+THREE.ColorManagement.enabled = false;
+
 const REGION_ID = Number(new URLSearchParams(location.search).get("region") ?? "12850");
 
 const hud = document.getElementById("hud")!;
@@ -68,10 +75,31 @@ async function main(): Promise<void> {
       `terrain: ${region.terrainMeta.totalVertexCount} verts   locs: ${region.locs.placements.length} placements / ${region.locs.blocks.length} blocks`,
   );
 
+  // Load the shared atlas texture. `NearestFilter` keeps the chunky RS look
+  // instead of smearing adjacent cells together under linear filtering.
+  const atlasTexture = await new Promise<THREE.Texture>((resolve, reject) => {
+    new THREE.TextureLoader().load(region.atlasUrl, resolve, undefined, reject);
+  });
+  atlasTexture.magFilter = THREE.NearestFilter;
+  atlasTexture.minFilter = THREE.NearestFilter;
+  atlasTexture.generateMipmaps = false;
+  atlasTexture.wrapS = THREE.ClampToEdgeWrapping;
+  atlasTexture.wrapT = THREE.ClampToEdgeWrapping;
+  // With ColorManagement.enabled = false the colorSpace flag is a no-op.
+  // We leave it as NoColorSpace so Three doesn't silently convert later if
+  // color management gets re-enabled.
+  atlasTexture.colorSpace = THREE.NoColorSpace;
+  // Three.js's default `flipY = true` vertically mirrors the PNG at upload,
+  // which would put cell 0 (top-left of the canvas) at UV V=1. Our cell-index
+  // math assumes canvas top-left = UV (0, 0), so disable the flip.
+  atlasTexture.flipY = false;
+
   const terrainGroup = buildTerrainMeshes(
     region.terrainMeta,
     region.terrainPositions,
     region.terrainColors,
+    region.terrainUvs,
+    atlasTexture,
   );
   scene.add(terrainGroup);
 
@@ -79,8 +107,10 @@ async function main(): Promise<void> {
     region.locs,
     region.locsPositions,
     region.locsColors,
+    region.locsUvs,
     region.terrainMeta,
     region.terrainHeights,
+    atlasTexture,
   );
   scene.add(locsGroup);
 

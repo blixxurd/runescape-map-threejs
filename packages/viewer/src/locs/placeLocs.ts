@@ -17,8 +17,10 @@ export function placeLocs(
   manifest: LocsManifest,
   positions: Float32Array,
   colors: Uint8Array,
+  uvs: Float32Array,
   terrainMeta: TerrainMeta,
   terrainHeights: Int16Array,
+  atlasTexture: THREE.Texture,
 ): THREE.Group {
   const group = new THREE.Group();
   group.name = `locs:${terrainMeta.regionId}`;
@@ -30,6 +32,8 @@ export function placeLocs(
     const posEnd = posStart + block.vertexCount * 3;
     const colStart = block.colorsByteOffset;
     const colEnd = colStart + block.vertexCount * 4;
+    const uvStart = block.uvsByteOffset / 4;
+    const uvEnd = uvStart + block.vertexCount * 2;
 
     const geom = new THREE.BufferGeometry();
     geom.setAttribute(
@@ -40,19 +44,19 @@ export function placeLocs(
       "color",
       new THREE.BufferAttribute(colors.subarray(colStart, colEnd), 4, true),
     );
+    geom.setAttribute("uv", new THREE.BufferAttribute(uvs.subarray(uvStart, uvEnd), 2));
     geom.computeVertexNormals();
     return geom;
   });
 
-  // Shared material — every loc gets vertex-colored flat shading.
-  const mat = new THREE.MeshStandardMaterial({
+  // MeshBasicMaterial (no scene lighting) because the extractor pre-bakes
+  // per-face lighting into the vertex colors, matching the OSRS client's
+  // runtime pipeline (texture × pre-lit vertex color, no shader lights).
+  // Using MeshStandardMaterial here would double-darken textured walls.
+  // DoubleSide covers the inconsistent face winding in loc models.
+  const mat = new THREE.MeshBasicMaterial({
     vertexColors: true,
-    flatShading: true,
-    metalness: 0.0,
-    roughness: 1.0,
-    // DoubleSide because loc models have inconsistent face winding and
-    // authored 2-sided quads we don't track separately. Lighting suffers
-    // slightly but without this half the walls vanish from viewing angles.
+    map: atlasTexture,
     side: THREE.DoubleSide,
   });
 

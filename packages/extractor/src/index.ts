@@ -3,9 +3,21 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { RSCache } from "osrscachereader";
 import { ensureCache, resolveCache, type CacheMeta } from "./download.js";
-import { bakeTerrain, writeTerrainBundle } from "./region/terrain.js";
-import { bakeLocs, writeLocsBundle } from "./region/locs.js";
+import {
+  prepareTerrain,
+  collectTerrainTextureIds,
+  emitTerrain,
+  writeTerrainBundle,
+} from "./region/terrain.js";
+import {
+  prepareLocs,
+  collectLocsTextureIds,
+  emitLocs,
+  writeLocsBundle,
+} from "./region/locs.js";
+import { buildAtlas, writeAtlas } from "./texture/atlas.js";
 import { patchObjectLoader, getObjectLoaderFailureCount } from "./patches/objectLoader.js";
+import { patchFloorLoaders } from "./patches/floorLoaders.js";
 
 /**
  * CLI: `pnpm extract -- --region <id>`
@@ -32,6 +44,7 @@ const DEFAULT_BUILD = 234;
 
 async function extractRegion(regionId: number, requestedBuild?: number): Promise<void> {
   await patchObjectLoader();
+  await patchFloorLoaders();
   const regionX = (regionId >> 8) & 0xff;
   const regionZ = regionId & 0xff;
   console.log(`[extract] region ${regionId} = (${regionX}, ${regionZ})`);
@@ -53,13 +66,28 @@ async function extractRegion(regionId: number, requestedBuild?: number): Promise
     const outDir = join(VIEWER_REGIONS, String(regionId));
     mkdirSync(outDir, { recursive: true });
 
-    const terrain = await bakeTerrain(rs, regionX, regionZ, {
-      buildId: cacheMeta.build,
-      sourceCacheId: cacheMeta.id,
-    });
-    await writeTerrainBundle(terrain, outDir);
+    // Phase 1: resolve both pipelines in parallel (they don't yet know atlas).
+    const [terrainPlan, locsPlan] = await Promise.all([
+      prepareTerrain(rs, regionX, regionZ, {
+        buildId: cacheMeta.build,
+        sourceCacheId: cacheMeta.id,
+      }),
+      prepareLocs(rs, regionX, regionZ),
+    ]);
 
-    const locs = await bakeLocs(rs, regionX, regionZ);
+    // Phase 2: build one atlas over every textureId referenced anywhere.
+    const textureIds = new Set<number>([
+      ...collectTerrainTextureIds(terrainPlan),
+      ...collectLocsTextureIds(locsPlan),
+    ]);
+    console.log(`[atlas] ${textureIds.size} unique textures (terrain + locs)`);
+    const atlas = await buildAtlas(rs, textureIds);
+    await writeAtlas(atlas, outDir);
+
+    // Phase 3: emit both geometries with UVs keyed to the final atlas.
+    const terrain = emitTerrain(terrainPlan, atlas);
+    await writeTerrainBundle(terrain, outDir);
+    const locs = emitLocs(locsPlan, atlas);
     await writeLocsBundle(locs, outDir);
 
     const failures = getObjectLoaderFailureCount();

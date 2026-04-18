@@ -4,3 +4,4 @@ dist/
 .DS_Store
 *.log
 packages/viewer/public/regions/
+reference/
