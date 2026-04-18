@@ -68,6 +68,62 @@ export interface TerrainMeta {
    */
   heightsFile: string; // "terrain.heights.bin"
   heightsByteLength: number;
+  /**
+   * Per-triangle tile index, used by the debug-inspector to resolve a
+   * raycast hit back to cache data. Layout: Uint16 per triangle, value =
+   * `tileZ * 64 + tileX` within that triangle's plane. Triangles are in
+   * the same order as `positionsFile`. Plane boundaries are at
+   * `planeRanges[i].vertexCount / 3` triangle offsets.
+   */
+  triangleTilesFile: string; // "terrain.tri_tiles.bin"
+  triangleTilesByteLength: number;
+}
+
+/**
+ * Per-tile cache data used exclusively by the in-viewer debug inspector.
+ * Kept separate from the rendering bundle so the runtime load is cheap
+ * when debug is off.
+ */
+export interface TerrainDebug {
+  schemaVersion: 1;
+  regionId: number;
+  /** Plane-major tiles (4 × 64 × 64). `tiles[plane*4096 + z*64 + x]`. */
+  tiles: TerrainDebugTile[];
+  underlays: Record<number, DebugUnderlayDef>;
+  overlays: Record<number, DebugOverlayDef>;
+}
+
+export interface TerrainDebugTile {
+  plane: number;
+  x: number;
+  z: number;
+  underlayId: number; // 0 means "no underlay"
+  overlayId: number; // 0 means "no overlay"
+  overlayShape: number;
+  overlayRotation: number;
+  settings: number;
+  /** blended packed HSL16 at this tile (the value we sampled for rendering) */
+  blendedHsl: number;
+}
+
+export interface DebugUnderlayDef {
+  id: number;
+  rawRgb: number; // 0xRRGGBB
+  hue: number;
+  saturation: number;
+  lightness: number;
+  hueMultiplier: number;
+  textureId?: number;
+}
+
+export interface DebugOverlayDef {
+  id: number;
+  rawRgb: number; // 0xRRGGBB
+  packedHsl: number;
+  textureId: number;
+  hideUnderlay: boolean;
+  secondaryColor?: number;
+  secondaryTextureId?: number;
 }
 
 /**
@@ -149,4 +205,22 @@ export interface LocsManifest {
   uvsFile: string; // "locs.uv.bin"
   /** loc ids that appeared in placements but could not be resolved (missing from cache). */
   skippedLocIds: number[];
+}
+
+/** Debug-only summary for a single resolved loc block. */
+export interface LocDebugBlock {
+  locId: number;
+  modelType: number;
+  bakedRotation: number;
+  faceCount: number;
+  texturedFaceCount: number;
+  distinctFaceColors: number;
+  /** object definition name if the cache provided one (may be omitted) */
+  name?: string;
+}
+
+export interface LocsDebug {
+  schemaVersion: 1;
+  /** Parallel to `LocsManifest.blocks` by index. */
+  blocks: LocDebugBlock[];
 }

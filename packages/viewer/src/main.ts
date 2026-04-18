@@ -4,6 +4,7 @@ import { TILE_SIZE, TILES_PER_SIDE } from "@rsmap/shared";
 import { loadRegion } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs } from "./locs/placeLocs.js";
+import { DebugInspector } from "./debug/inspector.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
 // gamma/linear-space conversions. With Three's default color management on,
@@ -113,6 +114,16 @@ async function main(): Promise<void> {
     atlasTexture,
   );
   scene.add(locsGroup);
+
+  // Debug inspector — shift-hover to see cache data for the thing under
+  // the cursor. Debug bundles are fetched lazily on first shift.
+  new DebugInspector(
+    { camera, renderer, terrainGroup, locsGroup },
+    REGION_ID,
+    region.locs,
+    region.terrainMeta,
+    region.atlas,
+  );
 
   // Simple render loop.
   const tick = (): void => {

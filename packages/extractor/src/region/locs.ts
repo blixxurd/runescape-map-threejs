@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { hsl16ToRgb } from "../color/hsl.js";
 import { computeFaceUv, cellUV } from "../texture/locFaceUv.js";
 import type { BakedAtlas } from "../texture/atlas.js";
-import type { LocsManifest, LocBlock, LocPlacement } from "@rsmap/shared";
+import type { LocsManifest, LocBlock, LocPlacement, LocsDebug, LocDebugBlock } from "@rsmap/shared";
 
 /**
  * Client-authentic per-face lighting, ported from `Model.applyLighting` +
@@ -252,6 +252,7 @@ export interface BakedLocs {
   positions: Float32Array;
   colors: Uint8Array;
   uvs: Float32Array;
+  debug: LocsDebug;
 }
 
 
@@ -465,12 +466,38 @@ export function emitLocs(plan: LocsPlan, atlas: BakedAtlas): BakedLocs {
     skippedLocIds: Array.from(plan.skippedLocIds).sort((a, b) => a - b),
   };
 
+  // Parallel per-block debug: face counts + texture counts + distinct color
+  // counts + object name, keyed by the same array index as `manifest.blocks`.
+  const debugBlocks: LocDebugBlock[] = plan.blocks.map((rb) => {
+    const m = rb.model;
+    const faceCount = m.faceVertexIndices1.length;
+    let texturedFaceCount = 0;
+    const distinct = new Set<number>();
+    const ft = m.faceTextures;
+    const fc = m.faceColors;
+    for (let i = 0; i < faceCount; i++) {
+      if (ft && (ft[i] as number) >= 0) texturedFaceCount++;
+      if (fc) distinct.add(fc[i] as number);
+    }
+    // The objDef was resolved during `prepareLocs` but not kept on the
+    // ResolvedBlock; we could thread it through, but name is optional.
+    return {
+      locId: rb.locId,
+      modelType: rb.modelType,
+      bakedRotation: rb.bakedRotation,
+      faceCount,
+      texturedFaceCount,
+      distinctFaceColors: distinct.size,
+    };
+  });
+  const debug: LocsDebug = { schemaVersion: 1, blocks: debugBlocks };
+
   const r = plan.skipReasons;
   console.log(
     `[locs] ${blocks.length} blocks, ${placements.length} placements, ` +
       `${plan.skippedLocIds.size} locIds skipped (noDef=${r.noDef} noModel=${r.noModel} empty=${r.emptyModel} err=${r.error})`,
   );
-  return { manifest, positions, colors, uvs };
+  return { manifest, positions, colors, uvs, debug };
 }
 
 export async function writeLocsBundle(baked: BakedLocs, outDir: string): Promise<void> {
@@ -478,6 +505,7 @@ export async function writeLocsBundle(baked: BakedLocs, outDir: string): Promise
   await writeFile(join(outDir, baked.manifest.colorsFile), Buffer.from(baked.colors.buffer));
   await writeFile(join(outDir, baked.manifest.uvsFile), Buffer.from(baked.uvs.buffer));
   await writeFile(join(outDir, "locs.json"), JSON.stringify(baked.manifest));
+  await writeFile(join(outDir, "locs.debug.json"), JSON.stringify(baked.debug));
   console.log(
     `[locs] wrote locs bundle: ${(baked.manifest.positionsByteLength / 1024).toFixed(1)} KB pos, ` +
       `${(baked.manifest.colorsByteLength / 1024).toFixed(1)} KB col, ` +

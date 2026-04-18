@@ -95,6 +95,8 @@ export interface TriangleSoupOut {
   positions: number[]; // [x, y, z, x, y, z, ...]
   colors: number[]; // [r, g, b, a, r, g, b, a, ...], all 0..255
   uvs: number[]; // [u, v, u, v, ...]
+  /** Per-triangle tile index: `tileZ * TILES_PER_SIDE + tileX` (one entry per triangle). */
+  triangleTiles: number[];
 }
 
 /**
@@ -334,5 +336,6 @@ export function emitTileTriangles(
       rgbC[0], rgbC[1], rgbC[2], 255,
     );
     out.uvs.push(uA, vA, uB, vB, uC, vC);
+    out.triangleTiles.push(tileZ * 64 + tileX);
   }
 }

@@ -97,6 +97,10 @@ export function placeLocs(
     const geom = geometries[b]!;
     const inst = new THREE.InstancedMesh(geom, mat, onPlane.length);
     inst.name = `loc:${block.locId}:${block.modelType}:${block.bakedRotation}`;
+    // Used by the debug inspector to map a raycast `instanceId` back to a
+    // concrete placement.
+    inst.userData.blockIndex = b;
+    inst.userData.placementIdxs = onPlane;
 
     for (let i = 0; i < onPlane.length; i++) {
       const p = manifest.placements[onPlane[i]!]!;

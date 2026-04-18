@@ -12,11 +12,41 @@
         background: rgba(0, 0, 0, 0.55); font-size: 12px; line-height: 1.5;
         pointer-events: none; white-space: pre;
       }
+      #inspector {
+        position: fixed; top: 0; left: 0; padding: 8px 10px; border-radius: 4px;
+        background: rgba(0, 0, 0, 0.82); color: #d5dce8;
+        font-size: 11px; line-height: 1.45;
+        pointer-events: none; white-space: pre; z-index: 10;
+        max-width: 360px; border: 1px solid #2a334a;
+        display: none; transform: translate(12px, 12px);
+      }
+      #inspector .k { color: #7aa6d6; }
+      #inspector .v { color: #e6e8ec; }
+      #inspector .sw {
+        display: inline-block; width: 10px; height: 10px;
+        border: 1px solid #000; vertical-align: middle; margin-right: 4px;
+      }
+      #inspectHint {
+        position: fixed; bottom: 8px; right: 8px; padding: 4px 8px;
+        background: rgba(0, 0, 0, 0.55); color: #8f9bb5; font-size: 11px;
+        pointer-events: none; border-radius: 3px;
+      }
+      #copyToast {
+        position: fixed; padding: 6px 10px; border-radius: 3px;
+        background: #2d4b2d; color: #e8f5e8; font-size: 11px;
+        pointer-events: none; z-index: 11; opacity: 0;
+        transform: translate(12px, 12px);
+        transition: opacity 0.15s ease-out;
+      }
+      #copyToast.show { opacity: 1; }
     </style>
   </head>
   <body>
     <div id="app"></div>
     <div id="hud">loading…</div>
+    <div id="inspector"></div>
+    <div id="inspectHint">hold <b>shift</b> to inspect · <b>shift+click</b> to copy</div>
+    <div id="copyToast"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

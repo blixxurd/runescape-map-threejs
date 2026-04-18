@@ -126,6 +126,18 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
   default sRGB-to-linear-to-sRGB pipeline would double-encode and produce
   a yellow cast. Atlas texture colorSpace is `NoColorSpace`.
 
+## Debug inspector
+
+Hold **Shift** while hovering the viewer → a panel appears with the cache
+data for the tile / loc under the cursor (plane, tile coords, underlay/overlay
+ids + textureIds, raw RGB, blended HSL, loc type + rotation, face counts, etc).
+**Shift+click** copies a compact paste-ready block to the clipboard — the
+preferred way to report visual bugs.
+
+Implementation: `packages/viewer/src/debug/inspector.ts`. Debug data lives in
+`terrain.debug.json`, `terrain.tri_tiles.bin`, and `locs.debug.json`; all are
+lazy-loaded on first Shift press so normal rendering has zero cost.
+
 ## Where things live
 
 | file | purpose |

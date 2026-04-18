@@ -17,7 +17,13 @@ import {
   type TileAtlasInfo,
 } from "../tables/tileShapes.js";
 import type { BakedAtlas } from "../texture/atlas.js";
-import type { TerrainMeta } from "@rsmap/shared";
+import type {
+  TerrainMeta,
+  TerrainDebug,
+  TerrainDebugTile,
+  DebugUnderlayDef,
+  DebugOverlayDef,
+} from "@rsmap/shared";
 import { TILES_PER_SIDE, VERTICES_PER_SIDE, PLANES, TILE_SIZE } from "@rsmap/shared";
 
 interface ResolvedPalette {
@@ -150,6 +156,8 @@ export interface BakedTerrain {
   colors: Uint8Array;
   uvs: Float32Array;
   heights: Int16Array;
+  triangleTiles: Uint16Array;
+  debug: TerrainDebug;
 }
 
 /** Phase 2: emit geometry with UVs into the given atlas. */
@@ -160,11 +168,14 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
     atlasSize: atlas.manifest.atlasSize,
   };
 
-  const perPlane: { positions: number[]; colors: number[]; uvs: number[] }[] = [];
+  const perPlane: { positions: number[]; colors: number[]; uvs: number[]; triangleTiles: number[] }[] = [];
+  // Debug tiles — one entry per (plane, x, z) we actually emit.
+  const debugTiles: TerrainDebugTile[] = [];
   for (let plane = 0; plane < PLANES; plane++) {
     const positions: number[] = [];
     const colors: number[] = [];
     const uvs: number[] = [];
+    const triangleTiles: number[] = [];
 
     const planeHeights: number[] = new Array(VERTICES_PER_SIDE * VERTICES_PER_SIDE);
     for (let vz = 0; vz < VERTICES_PER_SIDE; vz++) {
@@ -211,11 +222,24 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
         const tile = map.tiles[plane]?.[x]?.[z];
         if (!tile) continue;
 
-        const shape = tile.overlayPath ?? 0;
+        // Cache stores `overlayPath` in 0..11. The render shape index is
+        // `overlayPath + 1` per `Landscape.java:517` (cross-checked in
+        // `reference/Model.java` + `SceneBuilder.addTileModels`). Our
+        // shape table puts "2 underlay triangles" at index 0 and "2
+        // overlay triangles" at index 1, so without this +1 any tile
+        // fully covered by an overlay (overlayPath=0) rendered as pure
+        // underlay (e.g. water tiles showed as grass).
+        //
+        // `Math.floor` because osrscachereader's MapLoader computes
+        // `tile.overlayPath = (attribute - 2) / 4` — that's integer
+        // division in Java but floating-point in JS, so attributes like
+        // 20 give 4.5 → +1 = 5.5 → `TILE_SHAPE_FACES[5.5]` is undefined →
+        // we silently fell back to shape 0 = pure underlay.
         const rotation = tile.overlayRotation ?? 0;
         const overlayId = tile.overlayId ?? 0;
         const hasOverlay = overlayId > 0;
         const underlayId = tile.underlayId ?? 0;
+        const shape = hasOverlay ? Math.floor(tile.overlayPath ?? 0) + 1 : 0;
 
         // Atlas cells for this tile: underlay-side and overlay-side.
         let underlayCell = 0;
@@ -277,10 +301,23 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
           positions,
           colors,
           uvs,
+          triangleTiles,
+        });
+
+        debugTiles.push({
+          plane,
+          x,
+          z,
+          underlayId,
+          overlayId,
+          overlayShape: shape,
+          overlayRotation: rotation,
+          settings: tile.settings ?? 0,
+          blendedHsl: underlayPacked,
         });
       }
     }
-    perPlane.push({ positions, colors, uvs });
+    perPlane.push({ positions, colors, uvs, triangleTiles });
     console.log(
       `[terrain] plane ${plane}: ${positions.length / 9} triangles, ${colors.length / 4} vertices`,
     );
@@ -292,10 +329,13 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   const positions = new Float32Array(totalVertexCount * 3);
   const colors = new Uint8Array(totalVertexCount * 4);
   const uvs = new Float32Array(totalVertexCount * 2);
+  const totalTriCount = totalVertexCount / 3;
+  const triangleTiles = new Uint16Array(totalTriCount);
   const planeRanges: TerrainMeta["planeRanges"] = [];
   let posWrite = 0;
   let colWrite = 0;
   let uvWrite = 0;
+  let triWrite = 0;
   for (let plane = 0; plane < PLANES; plane++) {
     const p = perPlane[plane]!;
     const vCount = p.positions.length / 3;
@@ -309,9 +349,11 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
     for (let i = 0; i < p.positions.length; i++) positions[posWrite + i] = p.positions[i]!;
     for (let i = 0; i < p.colors.length; i++) colors[colWrite + i] = p.colors[i]!;
     for (let i = 0; i < p.uvs.length; i++) uvs[uvWrite + i] = p.uvs[i]!;
+    for (let i = 0; i < p.triangleTiles.length; i++) triangleTiles[triWrite + i] = p.triangleTiles[i]!;
     posWrite += p.positions.length;
     colWrite += p.colors.length;
     uvWrite += p.uvs.length;
+    triWrite += p.triangleTiles.length;
   }
 
   const heights16 = new Int16Array(PLANES * VERTICES_PER_SIDE * VERTICES_PER_SIDE);
@@ -344,9 +386,44 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
     uvsFile: "terrain.uv.bin",
     heightsFile: "terrain.heights.bin",
     heightsByteLength: heights16.byteLength,
+    triangleTilesFile: "terrain.tri_tiles.bin",
+    triangleTilesByteLength: triangleTiles.byteLength,
   };
 
-  return { meta, positions, colors, uvs, heights: heights16 };
+  const debugUnderlays: Record<number, DebugUnderlayDef> = {};
+  for (const [id, u] of palette.underlays) {
+    debugUnderlays[id] = {
+      id,
+      rawRgb: u.rawRgb ?? 0,
+      hue: u.hue,
+      saturation: u.saturation,
+      lightness: u.lightness,
+      hueMultiplier: u.hueMultiplier ?? 0,
+      textureId: u.textureId,
+    };
+  }
+  const debugOverlays: Record<number, DebugOverlayDef> = {};
+  for (const [id, o] of palette.overlays) {
+    debugOverlays[id] = {
+      id,
+      rawRgb: 0, // not captured by library for overlays; leave as 0
+      packedHsl: o.color,
+      textureId: o.texture,
+      hideUnderlay: o.hideUnderlay,
+      secondaryColor: o.secondaryColor,
+      secondaryTextureId: o.secondaryTextureId,
+    };
+  }
+
+  const debug: TerrainDebug = {
+    schemaVersion: 1,
+    regionId: meta.regionId,
+    tiles: debugTiles,
+    underlays: debugUnderlays,
+    overlays: debugOverlays,
+  };
+
+  return { meta, positions, colors, uvs, heights: heights16, triangleTiles, debug };
 }
 
 export async function writeTerrainBundle(baked: BakedTerrain, outDir: string): Promise<void> {
@@ -354,7 +431,9 @@ export async function writeTerrainBundle(baked: BakedTerrain, outDir: string): P
   await writeFile(join(outDir, baked.meta.colorsFile), Buffer.from(baked.colors.buffer));
   await writeFile(join(outDir, baked.meta.uvsFile), Buffer.from(baked.uvs.buffer));
   await writeFile(join(outDir, baked.meta.heightsFile), Buffer.from(baked.heights.buffer));
+  await writeFile(join(outDir, baked.meta.triangleTilesFile), Buffer.from(baked.triangleTiles.buffer));
   await writeFile(join(outDir, "terrain.meta.json"), JSON.stringify(baked.meta, null, 2));
+  await writeFile(join(outDir, "terrain.debug.json"), JSON.stringify(baked.debug));
   console.log(
     `[terrain] wrote ${baked.meta.totalVertexCount} vertices (` +
       `${(baked.meta.positionsByteLength / 1024).toFixed(1)} KB positions, ` +
