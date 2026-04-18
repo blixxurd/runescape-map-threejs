@@ -14,6 +14,7 @@ import { DebugInspector } from "./debug/inspector.js";
 THREE.ColorManagement.enabled = false;
 
 const REGION_ID = Number(new URLSearchParams(location.search).get("region") ?? "12850");
+const MAX_PLANE = 3;
 
 const hud = document.getElementById("hud")!;
 const setHud = (text: string): void => {
@@ -71,10 +72,6 @@ async function main(): Promise<void> {
 
   // Kick off region load while the scene is set up.
   const region = await loadRegion(REGION_ID);
-  setHud(
-    `region ${region.terrainMeta.regionId}  build ${region.terrainMeta.buildId}\n` +
-      `terrain: ${region.terrainMeta.totalVertexCount} verts   locs: ${region.locs.placements.length} placements / ${region.locs.blocks.length} blocks`,
-  );
 
   // Load the shared atlas texture. `NearestFilter` keeps the chunky RS look
   // instead of smearing adjacent cells together under linear filtering.
@@ -114,6 +111,37 @@ async function main(): Promise<void> {
     atlasTexture,
   );
   scene.add(locsGroup);
+
+  // Plane cap — OSRS roof-removal. Default 1: ground + bridges visible,
+  // upper stories + roofs hidden. `[` goes down a floor, `]` goes up.
+  // Shows cumulative: every plane ≤ cap is visible, so cap=3 shows all.
+  let planeCap = 1;
+  const applyPlaneCap = (): void => {
+    for (const child of terrainGroup.children) {
+      const p = (child.userData as { plane?: number }).plane;
+      if (p !== undefined) child.visible = p <= planeCap;
+    }
+    for (const child of locsGroup.children) {
+      const p = (child.userData as { plane?: number }).plane;
+      if (p !== undefined) child.visible = p <= planeCap;
+    }
+    updateHud();
+  };
+  const hudBase = `region ${region.terrainMeta.regionId}  build ${region.terrainMeta.buildId}\n` +
+    `terrain: ${region.terrainMeta.totalVertexCount} verts   locs: ${region.locs.placements.length} placements / ${region.locs.blocks.length} blocks`;
+  const updateHud = (): void => {
+    setHud(`${hudBase}\nvisible: plane 0..${planeCap}   [ / ] to change`);
+  };
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "[" && planeCap > 0) {
+      planeCap--;
+      applyPlaneCap();
+    } else if (e.key === "]" && planeCap < MAX_PLANE) {
+      planeCap++;
+      applyPlaneCap();
+    }
+  });
+  applyPlaneCap();
 
   // Debug inspector — shift-hover to see cache data for the thing under
   // the cursor. Debug bundles are fetched lazily on first shift.

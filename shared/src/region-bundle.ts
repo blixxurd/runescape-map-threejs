@@ -165,6 +165,11 @@ export interface LocBlock {
   modelType: number;
   /** Full 0..7 rotation that was baked into the model. */
   bakedRotation: number;
+  /** Bounding-box tile footprint from the ObjectDefinition (1..N).
+   *  Used by NORMAL/NORMAL_DIAGIONAL placement to offset to the center
+   *  of the footprint; WALL/FLOOR_DEC/ROOF ignore it (1×1 placement). */
+  sizeX: number;
+  sizeY: number;
   vertexCount: number;
   positionsByteOffset: number;
   colorsByteOffset: number;

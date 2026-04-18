@@ -65,6 +65,30 @@ function applyLightToHsl(hsl: number, lightness: number): number {
 }
 
 /**
+ * "Shadow overlay" lookup — port of `anIntArray3199` in `Model.java`. Used
+ * by faces where `faceRenderTypes & 0x2 == 2`: no HSL color at all, the
+ * face is filled with a greyscale shade derived purely from the computed
+ * per-face lightness. Roofs use this for subtle shading strips; lanterns
+ * and light-emitters for bright halos.
+ *
+ * Table shape: mostly-white for low lightness indices, mostly-black for
+ * high lightness — because the lightness "index" computed for these faces
+ * runs the opposite direction from the normal HSL pipeline. The static
+ * initializer is transcribed verbatim from `Model.java:77-94`.
+ */
+const SHADOW_LOOKUP = (() => {
+  const a = new Uint8Array(128);
+  let i = 0;
+  let v = 248;
+  while (i < 9) a[i++] = 255;
+  while (i < 16) { a[i++] = v; v -= 8; }
+  while (i < 32) { a[i++] = v; v -= 4; }
+  while (i < 64) { a[i++] = v; v -= 2; }
+  while (i < 128) a[i++] = v--;
+  return a;
+})();
+
+/**
  * OSRS applies per-loc face recolors/retextures via the `recolorToFind →
  * recolorToReplace` arrays on the object def. The library's `getModel` tries
  * but reads the wrong field names (`recolorFrom`/`retextureFrom`) and
@@ -114,6 +138,17 @@ function expandPlacement(type: number, rotation: number): BlockDraw[] {
         { modelType: 2, bakedRotation: rotation + 4 },
         { modelType: 2, bakedRotation: (rotation + 1) & 3 },
       ];
+    case 5: // WALL_DECORATION_OUTSIDE: resolves to modelType 4 (INSIDE) geom
+      return [{ modelType: 4, bakedRotation: rotation }];
+    case 6: // WALL_DECORATION_DIAGONAL_OUTSIDE: modelType 4, rot+4
+      return [{ modelType: 4, bakedRotation: rotation + 4 }];
+    case 7: // WALL_DECORATION_DIAGONAL_INSIDE: modelType 4, insideRot+4
+      return [{ modelType: 4, bakedRotation: ((rotation + 2) & 3) + 4 }];
+    case 8: // WALL_DECORATION_DIAGONAL_DOUBLE: two modelType-4 draws
+      return [
+        { modelType: 4, bakedRotation: rotation + 4 },
+        { modelType: 4, bakedRotation: ((rotation + 2) & 3) + 4 },
+      ];
     case 11: // NORMAL_DIAGIONAL
       return [{ modelType: 10, bakedRotation: rotation + 4 }];
     default:
@@ -128,6 +163,8 @@ interface ResolvedBlock {
   locId: number;
   modelType: number;
   bakedRotation: number;
+  sizeX: number;
+  sizeY: number;
   model: ModelDefinition;
 }
 
@@ -225,7 +262,15 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     applyRecolor(model, objDef);
     applyRetexture(model, objDef);
     blockIndexByKey.set(key, blocks.length);
-    blocks.push({ key, locId: draw.locId, modelType: draw.modelType, bakedRotation: draw.bakedRotation, model });
+    blocks.push({
+      key,
+      locId: draw.locId,
+      modelType: draw.modelType,
+      bakedRotation: draw.bakedRotation,
+      sizeX: objDef.sizeX ?? 1,
+      sizeY: objDef.sizeY ?? 1,
+      model,
+    });
   }
 
   return { regionX, regionZ, locDef, blocks, blockIndexByKey, skippedLocIds, skipReasons };
@@ -338,8 +383,38 @@ function flattenModel(
     // Color + texture selection per face.
     const faceTexId = (model.faceTextures?.[i] as number | undefined) ?? -1;
     const faceHsl = (model.faceColors?.[i] as number) ?? 0;
+    const faceRenderType =
+      ((model as unknown as { faceRenderTypes?: ArrayLike<number> }).faceRenderTypes?.[i] as
+        | number
+        | undefined) ?? 0;
+    const faceAlpha =
+      (model.faceAlphas?.[i] as number | undefined) ?? 0; // 0 = opaque, 255 = invisible
+    // Skip fully-transparent faces outright. OSRS models use alpha=255
+    // sentinels for faces that should not render at all (common: interior
+    // culling quads, bounding placeholders). Otherwise pass through and
+    // encode alpha on the vertex color so Three blends it.
+    if (faceAlpha >= 255) continue;
+    const vertexAlpha = 255 - faceAlpha;
     const uvOff = i * 6;
     const coff = i * 12;
+
+    // Render-type-2 faces bypass HSL entirely. `method816` clamps the
+    // per-face lightness to [0, 127], looks up `anIntArray3199[lightness]`
+    // to get a greyscale byte, and uses that directly. Roofs use this
+    // for shadow/highlight strips; missing the check renders them as
+    // bright near-white polygons ("weird white shape" on roofs).
+    if ((faceRenderType & 0x2) === 2) {
+      const idx = Math.max(0, Math.min(127, lightness));
+      const grey = SHADOW_LOOKUP[idx]!;
+      const [u0w, v0w] = cellUV(atlasSize, cellsPerRow, 0, 0.5, 0.5);
+      uvs[uvOff + 0] = u0w; uvs[uvOff + 1] = v0w;
+      uvs[uvOff + 2] = u0w; uvs[uvOff + 3] = v0w;
+      uvs[uvOff + 4] = u0w; uvs[uvOff + 5] = v0w;
+      colors[coff + 0] = grey; colors[coff + 1] = grey; colors[coff + 2] = grey; colors[coff + 3] = vertexAlpha;
+      colors[coff + 4] = grey; colors[coff + 5] = grey; colors[coff + 6] = grey; colors[coff + 7] = vertexAlpha;
+      colors[coff + 8] = grey; colors[coff + 9] = grey; colors[coff + 10] = grey; colors[coff + 11] = vertexAlpha;
+      continue;
+    }
 
     // Lit HSL = method816 on the face's stored HSL. For textured faces,
     // this is the tint that multiplies the sampled texel; for untextured
@@ -362,7 +437,7 @@ function flattenModel(
           colors[coff + k * 4 + 0] = litR;
           colors[coff + k * 4 + 1] = litG;
           colors[coff + k * 4 + 2] = litB;
-          colors[coff + k * 4 + 3] = 255;
+          colors[coff + k * 4 + 3] = vertexAlpha;
         }
         continue;
       }
@@ -375,9 +450,9 @@ function flattenModel(
     uvs[uvOff + 2] = u0w; uvs[uvOff + 3] = v0w;
     uvs[uvOff + 4] = u0w; uvs[uvOff + 5] = v0w;
 
-    colors[coff + 0] = litR; colors[coff + 1] = litG; colors[coff + 2] = litB; colors[coff + 3] = 255;
-    colors[coff + 4] = litR; colors[coff + 5] = litG; colors[coff + 6] = litB; colors[coff + 7] = 255;
-    colors[coff + 8] = litR; colors[coff + 9] = litG; colors[coff + 10] = litB; colors[coff + 11] = 255;
+    colors[coff + 0] = litR; colors[coff + 1] = litG; colors[coff + 2] = litB; colors[coff + 3] = vertexAlpha;
+    colors[coff + 4] = litR; colors[coff + 5] = litG; colors[coff + 6] = litB; colors[coff + 7] = vertexAlpha;
+    colors[coff + 8] = litR; colors[coff + 9] = litG; colors[coff + 10] = litB; colors[coff + 11] = vertexAlpha;
   }
 
   if (!Number.isFinite(min[0])) {
@@ -403,6 +478,8 @@ export function emitLocs(plan: LocsPlan, atlas: BakedAtlas): BakedLocs {
       locId: rb.locId,
       modelType: rb.modelType,
       bakedRotation: rb.bakedRotation,
+      sizeX: rb.sizeX,
+      sizeY: rb.sizeY,
       vertexCount,
       positionsByteOffset: posByteCursor,
       colorsByteOffset: colByteCursor,

@@ -304,8 +304,16 @@ export function emitTileTriangles(
     if (b < 4) b = (b - rotation) & 3;
     if (c < 4) c = (c - rotation) & 3;
 
-    // Skip fully void tiles (no underlay, no overlay).
-    if (!isOverlayFace && !hasAnyUnderlay && !hasOverlay) continue;
+    // Skip underlay triangles when the tile has no underlay color. In the
+    // client this happens naturally: `hslBitsetOriginal = -1` when
+    // `underlayId == 0`, and `mixLightness(-1, …)` returns the
+    // "transparent" sentinel 12345678 so the rasterizer skips the
+    // triangle. That's how upstairs tiles (plane > 0) get their "open
+    // air over empty tile" half when shape subdivides into overlay +
+    // underlay pieces. If we emitted a fallback color here, the tile
+    // would look like a solid square with half the expected texture
+    // and half grey. (See reference/Landscape.java:487 for context.)
+    if (!isOverlayFace && !hasAnyUnderlay) continue;
 
     const rgbA = isOverlayFace ? vOver[a]! : vUnder[a]!;
     const rgbB = isOverlayFace ? vOver[b]! : vUnder[b]!;

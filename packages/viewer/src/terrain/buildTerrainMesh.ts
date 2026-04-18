@@ -52,7 +52,12 @@ export function buildTerrainMeshes(
 
     const mesh = new THREE.Mesh(geom, mat);
     mesh.name = `terrain:plane${range.plane}`;
-    mesh.visible = range.plane === 0;
+    // Visibility is controlled by the viewer's current "plane cap" —
+    // OSRS's roof-removal convention, where every plane <= cap is shown.
+    mesh.userData.plane = range.plane;
+    // Default: bridges visible, upper roofs hidden. main.ts can change
+    // this via setPlaneCap.
+    mesh.visible = range.plane <= 1;
     group.add(mesh);
   }
   return group;
