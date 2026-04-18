@@ -14,8 +14,10 @@ packages/extractor/   Node CLI — decodes one region → static bundle
           │            uses osrscachereader for cache I/O + XTEA
           ▼
 packages/viewer/public/regions/<id>/
-  terrain.meta.json  + terrain.pos.bin + terrain.col.bin + terrain.heights.bin
-  locs.json          + locs.pos.bin    + locs.col.bin
+  terrain.meta.json  + terrain.pos.bin + terrain.col.bin + terrain.uv.bin
+                     + terrain.heights.bin
+  locs.json          + locs.pos.bin    + locs.col.bin    + locs.uv.bin
+  atlas.json         + atlas.png       (shared for both)
           │
           ▼
 packages/viewer/     Vite + Three.js app — fetches bundle, builds BufferGeometry
@@ -90,6 +92,10 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
 - ~~**No per-loc recoloring / retexturing**~~ Fixed — we apply the
   `recolorToFind → recolorToReplace` substitution ourselves in
   `packages/extractor/src/region/locs.ts` after `getModel` returns.
+- ~~**No overlay/loc textures**~~ Overlays, underlays, and loc face
+  textures are all decoded into a single shared atlas PNG and sampled
+  via per-vertex UVs. Loc face UVs use Gramian-inverse affine projection
+  onto each model's explicit texture triangle (OSRS render-type 0).
 - **~90 locIds skipped per region**, but on the pinned build 234 these are
   all legitimate "no geometry" cases, not parse failures. The extractor's
   final log line reports the breakdown: `noDef / noModel / empty / err`.
@@ -108,11 +114,17 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
 - **Single region only.** No streaming, no seam blending between adjacent
   map squares.
 - **No water / water animation.**
-- **Terrain lighting is pre-baked per vertex** using the OSRS
-  `calculateTileLights` formula (ported in `packages/extractor/src/color/terrainLight.ts`).
-  Terrain uses `MeshBasicMaterial` to avoid double-shading from the scene's
-  directional light. Locs still use `MeshStandardMaterial` + hemisphere +
-  directional sunlight.
+- **Terrain and loc lighting are both pre-baked** into per-vertex colors
+  using the OSRS client's exact algorithms (`Landscape.mixLightness` for
+  terrain, `Model.applyLighting` + `method816` for locs). Both meshes
+  use `MeshBasicMaterial` so Three.js doesn't double-shade. Reference
+  Java sources at `/reference/` (gitignored) — see `reference/AUDIT.md`
+  for the formula-by-formula comparison that drove the current
+  implementation.
+- **Color management is disabled** (`THREE.ColorManagement.enabled = false`)
+  because OSRS colors are authored in sRGB with no gamma pass — Three's
+  default sRGB-to-linear-to-sRGB pipeline would double-encode and produce
+  a yellow cast. Atlas texture colorSpace is `NoColorSpace`.
 
 ## Where things live
 
