@@ -31,17 +31,29 @@ interface ResolvedPalette {
   overlays: Map<number, OverlayDefinition>;
 }
 
-/** Find every unique underlay/overlay id in the region and resolve their defs once. */
-async function resolvePalette(cache: RSCache, map: MapDefinition): Promise<ResolvedPalette> {
+/**
+ * Find every unique underlay/overlay id across the center region and every
+ * loaded neighbor, and resolve their defs once. The neighbor maps contribute
+ * the 5-tile border needed for the 11×11 underlay blend window — an underlay
+ * id that exists in a neighbor but not the center still has to be resolved
+ * or the blend would silently drop it.
+ */
+async function resolvePalette(
+  cache: RSCache,
+  maps: (MapDefinition | null)[],
+): Promise<ResolvedPalette> {
   const underlayIds = new Set<number>();
   const overlayIds = new Set<number>();
-  for (let z = 0; z < PLANES; z++) {
-    for (let x = 0; x < TILES_PER_SIDE; x++) {
-      for (let y = 0; y < TILES_PER_SIDE; y++) {
-        const t = map.tiles[z]?.[x]?.[y];
-        if (!t) continue;
-        if (t.underlayId && t.underlayId > 0) underlayIds.add(t.underlayId);
-        if (t.overlayId && t.overlayId > 0) overlayIds.add(t.overlayId);
+  for (const map of maps) {
+    if (!map) continue;
+    for (let z = 0; z < PLANES; z++) {
+      for (let x = 0; x < TILES_PER_SIDE; x++) {
+        for (let y = 0; y < TILES_PER_SIDE; y++) {
+          const t = map.tiles[z]?.[x]?.[y];
+          if (!t) continue;
+          if (t.underlayId && t.underlayId > 0) underlayIds.add(t.underlayId);
+          if (t.overlayId && t.overlayId > 0) overlayIds.add(t.overlayId);
+        }
       }
     }
   }
@@ -70,26 +82,68 @@ async function resolvePalette(cache: RSCache, map: MapDefinition): Promise<Resol
 }
 
 /**
- * Per-tile blended packed-HSL grid. Client-authentic 11×11 window blend that
- * correctly normalizes the pre-weighted underlay hue via
- * `avgHue = (sumHue × 256) / sumMultiplier` (see memory notes for why this
- * matters).
+ * Width of the 5-tile border the blend needs past each region edge. Must
+ * match `BLEND_RADIUS` in `color/hsl.ts` (the client's 11×11 blend window
+ * radius). We pad the center region with this much neighbor data so the
+ * blend window at tile x=63 sees the east neighbor's [0..4] tiles — making
+ * the smoothed underlay colors line up across region seams.
+ */
+const SCENE_PAD = 5;
+const SCENE_SIZE = TILES_PER_SIDE + 2 * SCENE_PAD; // 74
+
+/**
+ * `neighbors[di + 1][dj + 1]` where `di, dj ∈ {-1, 0, 1}`. Self is [1][1].
+ * Null entries = ocean / missing-from-cache. Used to fill the 5-tile border
+ * around the center region for both the underlay blend and the contoured-loc
+ * height sampler.
+ */
+type NeighborGrid = (MapDefinition | null)[][];
+
+/**
+ * Per-tile blended packed-HSL grid, client-authentic.
+ *
+ * The OSRS client runs its 11×11 underlay blend (`Landscape.java:423–473`)
+ * on a 104×104 scene array that already contains data from every region the
+ * scene intersects. The blend therefore smoothly crosses region seams.
+ *
+ * We replicate that by building a 74×74 *padded* tile grid around the center
+ * region — center fills [5..68], neighbors fill the 5-tile border — then run
+ * the existing blend on it. After the blend, we return the central 64×64
+ * slice as the per-region output. Edge tiles now see up to 5 rows of
+ * neighbor data in the blend window and stop banding at seams.
+ *
+ * Where a neighbor is missing (ocean), that slice of the border is left
+ * null; the blend naturally handles missing tiles (`if(!u) continue`), so
+ * world-boundary regions fall back to the old truncated-window behavior
+ * there — the same thing the client does when a scene extends past loaded
+ * chunks.
  */
 function buildBlendedUnderlays(
-  map: MapDefinition,
+  neighbors: NeighborGrid,
   palette: ResolvedPalette,
 ): Int32Array[] {
   const perPlane: Int32Array[] = [];
   for (let plane = 0; plane < PLANES; plane++) {
-    const tileHsl: (UnderlayHsl | null)[] = new Array(TILES_PER_SIDE * TILES_PER_SIDE).fill(null);
-    for (let x = 0; x < TILES_PER_SIDE; x++) {
-      for (let z = 0; z < TILES_PER_SIDE; z++) {
-        const tile = map.tiles[plane]?.[x]?.[z];
+    const padded: (UnderlayHsl | null)[] = new Array(SCENE_SIZE * SCENE_SIZE).fill(null);
+    for (let pz = 0; pz < SCENE_SIZE; pz++) {
+      for (let px = 0; px < SCENE_SIZE; px++) {
+        // Map scene index → (neighbor, local tile). A px of 0..4 is the west
+        // neighbor's x=[59..63]; px of 5..68 is our region's x=[0..63];
+        // px of 69..73 is the east neighbor's x=[0..4]. Same for z.
+        const tx = px - SCENE_PAD;
+        const tz = pz - SCENE_PAD;
+        const di = tx < 0 ? -1 : tx >= TILES_PER_SIDE ? 1 : 0;
+        const dj = tz < 0 ? -1 : tz >= TILES_PER_SIDE ? 1 : 0;
+        const lx = tx - di * TILES_PER_SIDE;
+        const lz = tz - dj * TILES_PER_SIDE;
+        const src = neighbors[di + 1]![dj + 1]!;
+        if (!src) continue;
+        const tile = src.tiles[plane]?.[lx]?.[lz];
         const id = tile?.underlayId ?? 0;
         if (id === 0) continue;
         const def = palette.underlays.get(id);
         if (!def || def.hueMultiplier === undefined) continue;
-        tileHsl[z * TILES_PER_SIDE + x] = {
+        padded[pz * SCENE_SIZE + px] = {
           hue: def.hue,
           saturation: def.saturation,
           lightness: def.lightness,
@@ -97,7 +151,16 @@ function buildBlendedUnderlays(
         };
       }
     }
-    perPlane.push(blendUnderlayTiles(tileHsl, TILES_PER_SIDE));
+    const blendedPadded = blendUnderlayTiles(padded, SCENE_SIZE);
+    // Extract the central 64×64 block — that's our region's result.
+    const out = new Int32Array(TILES_PER_SIDE * TILES_PER_SIDE);
+    for (let z = 0; z < TILES_PER_SIDE; z++) {
+      for (let x = 0; x < TILES_PER_SIDE; x++) {
+        out[z * TILES_PER_SIDE + x] =
+          blendedPadded[(z + SCENE_PAD) * SCENE_SIZE + (x + SCENE_PAD)]!;
+      }
+    }
+    perPlane.push(out);
   }
   return perPlane;
 }
@@ -106,11 +169,126 @@ function buildBlendedUnderlays(
 export interface TerrainPlan {
   map: MapDefinition;
   palette: ResolvedPalette;
-  heights: number[][][]; // [plane][x][y] in client-space positive-up values
+  /** 65×65 per-vertex heights used for terrain mesh emission. Central
+   *  region's own tiles plus the east/north/NE edge stitched from neighbors
+   *  so x=64 / z=64 / (64,64) vertices match the adjacent regions. */
+  heights: number[][][];
+  /** 74×74 padded heights (`sceneHeights[plane][px][pz]`, px,pz ∈ [0..73])
+   *  used for contoured-loc vertex deformation so models whose geometry
+   *  extends past the region edge sample from the neighbor region's
+   *  heights, not a zero-filled default. Center region lives at px,pz ∈
+   *  [5..69]. See `samplePaddedSceneHeight` in `region/locs.ts`. */
+  sceneHeights: number[][][];
   blendedUnderlays: Int32Array[]; // per-plane packed-HSL grid
   regionX: number;
   regionZ: number;
   buildInfo: { buildId: number; sourceCacheId: number };
+}
+
+/**
+ * Best-effort load of a neighbor region. Returns null if the neighbor doesn't
+ * exist in the cache (ocean, off-map). osrscachereader throws from `getMap`
+ * when no archive matches the name hash, so catch and absorb.
+ */
+async function loadNeighborMap(
+  cache: RSCache,
+  regionX: number,
+  regionZ: number,
+): Promise<MapDefinition | null> {
+  try {
+    const map = await cache.getMap(regionX, regionZ);
+    if (!map || !map.tiles || !map.tiles[0]) return null;
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the 65×65 per-vertex heights grid for terrain mesh emission.
+ * `getHeights()` only gives 64×64 (one per tile SW corner), so the east
+ * column, north row, and NE corner come from neighbors' (0, z) / (x, 0) /
+ * (0, 0) tile corners.
+ *
+ * Without this the east + north edges of each region bundle were snapped
+ * to Y=0, giving a visible cliff where two regions meet (and a sub-horizon
+ * dip on the two far edges of a single-region view that fog happened to
+ * hide). Fallback when a neighbor is missing: replicate the edge we do
+ * have — flat ledge at the world boundary rather than a floor-dropping
+ * seam. Mirrors what the client does at the world edge.
+ */
+function stitchEdgeHeights(
+  self: number[][][],
+  neighbors: NeighborGrid,
+): void {
+  const eastH = neighbors[2]![1]?.getHeights() ?? null;
+  const northH = neighbors[1]![2]?.getHeights() ?? null;
+  const neH = neighbors[2]![2]?.getHeights() ?? null;
+  for (let plane = 0; plane < PLANES; plane++) {
+    const p = self[plane]!;
+    p[TILES_PER_SIDE] = new Array(VERTICES_PER_SIDE);
+    for (let z = 0; z < TILES_PER_SIDE; z++) {
+      const v = eastH?.[plane]?.[0]?.[z];
+      p[TILES_PER_SIDE]![z] = v ?? p[TILES_PER_SIDE - 1]![z]!;
+    }
+    for (let x = 0; x < TILES_PER_SIDE; x++) {
+      const v = northH?.[plane]?.[x]?.[0];
+      p[x]![TILES_PER_SIDE] = v ?? p[x]![TILES_PER_SIDE - 1]!;
+    }
+    const ne =
+      neH?.[plane]?.[0]?.[0] ??
+      eastH?.[plane]?.[0]?.[TILES_PER_SIDE - 1] ??
+      northH?.[plane]?.[TILES_PER_SIDE - 1]?.[0] ??
+      p[TILES_PER_SIDE - 1]![TILES_PER_SIDE - 1]!;
+    p[TILES_PER_SIDE]![TILES_PER_SIDE] = ne;
+  }
+}
+
+/**
+ * 74×74 padded per-tile heights (`[plane][px][pz]`, px,pz ∈ [0..73]) with the
+ * center region's heights at px,pz ∈ [5..69] and a 5-tile border drawn from
+ * each of the 8 neighbors. Used by contoured-loc vertex deformation so
+ * models that extend past the region edge sample the neighbor's heights
+ * instead of zero.
+ *
+ * Missing neighbors leave their slice replicated from the nearest
+ * in-bounds column — the same flat-edge fallback terrain emission uses.
+ * Heights are *tile SW corner* values (`getHeights()` semantics), so a
+ * padded index px/pz refers to the SW corner of the scene-space tile at
+ * that index.
+ */
+function buildSceneHeights(neighbors: NeighborGrid): number[][][] {
+  const cache: (number[][][] | null)[][] = neighbors.map((row) =>
+    row.map((map) => (map ? map.getHeights() : null)),
+  );
+  const sceneHeights: number[][][] = [];
+  for (let plane = 0; plane < PLANES; plane++) {
+    const planeGrid: number[][] = new Array(SCENE_SIZE);
+    for (let px = 0; px < SCENE_SIZE; px++) {
+      planeGrid[px] = new Array(SCENE_SIZE);
+      for (let pz = 0; pz < SCENE_SIZE; pz++) {
+        const tx = px - SCENE_PAD;
+        const tz = pz - SCENE_PAD;
+        let di = tx < 0 ? -1 : tx >= TILES_PER_SIDE ? 1 : 0;
+        let dj = tz < 0 ? -1 : tz >= TILES_PER_SIDE ? 1 : 0;
+        let lx = tx - di * TILES_PER_SIDE;
+        let lz = tz - dj * TILES_PER_SIDE;
+        let src = cache[di + 1]![dj + 1]!;
+        if (!src) {
+          // Neighbor absent: fall back to the nearest in-bounds column of
+          // the center region. Gives a flat ledge rather than y=0 cliffs.
+          di = 0;
+          dj = 0;
+          lx = Math.max(0, Math.min(TILES_PER_SIDE - 1, tx));
+          lz = Math.max(0, Math.min(TILES_PER_SIDE - 1, tz));
+          src = cache[1]![1]!;
+        }
+        planeGrid[px]![pz] = src?.[plane]?.[lx]?.[lz] ?? 0;
+      }
+    }
+    sceneHeights.push(planeGrid);
+  }
+  return sceneHeights;
 }
 
 /** Phase 1: resolve data (palette, heights, blends). No atlas, no geometry yet. */
@@ -126,13 +304,52 @@ export async function prepareTerrain(
     throw new Error(`No map data for region (${regionX}, ${regionZ})`);
   }
 
+  // Load the 8 cardinal + diagonal neighbors in parallel. We need them for:
+  //   - stitching our 65×65 terrain vertex grid at the east/north edges,
+  //   - running the underlay blend across the full 74×74 scene window,
+  //   - feeding the contoured-loc height sampler past our region edge.
+  // Missing neighbors (ocean, off-map) are null; every consumer handles that.
+  const neighborFlat = await Promise.all([
+    loadNeighborMap(cache, regionX - 1, regionZ - 1), // SW
+    loadNeighborMap(cache, regionX, regionZ - 1),     // S
+    loadNeighborMap(cache, regionX + 1, regionZ - 1), // SE
+    loadNeighborMap(cache, regionX - 1, regionZ),     // W
+    loadNeighborMap(cache, regionX + 1, regionZ),     // E
+    loadNeighborMap(cache, regionX - 1, regionZ + 1), // NW
+    loadNeighborMap(cache, regionX, regionZ + 1),     // N
+    loadNeighborMap(cache, regionX + 1, regionZ + 1), // NE
+  ]);
+  // Fold into `neighbors[di + 1][dj + 1]` with self at [1][1].
+  const neighbors: NeighborGrid = [
+    [neighborFlat[0], neighborFlat[3], neighborFlat[5]], // di = -1 (west column)
+    [neighborFlat[1], map,             neighborFlat[6]], // di =  0 (center column)
+    [neighborFlat[2], neighborFlat[4], neighborFlat[7]], // di =  1 (east column)
+  ];
+  const loadedCount = neighborFlat.filter((n) => n !== null).length;
+  console.log(`[terrain] loaded ${loadedCount}/8 neighbor regions for scene padding`);
+
   const heights = map.getHeights();
-  const palette = await resolvePalette(cache, map);
-  console.log(
-    `[terrain] ${palette.underlays.size} underlay defs, ${palette.overlays.size} overlay defs`,
+  stitchEdgeHeights(heights, neighbors);
+  const sceneHeights = buildSceneHeights(neighbors);
+
+  const palette = await resolvePalette(
+    cache,
+    neighborFlat.concat([map]),
   );
-  const blendedUnderlays = buildBlendedUnderlays(map, palette);
-  return { map, palette, heights, blendedUnderlays, regionX, regionZ, buildInfo };
+  console.log(
+    `[terrain] ${palette.underlays.size} underlay defs, ${palette.overlays.size} overlay defs (incl. neighbors)`,
+  );
+  const blendedUnderlays = buildBlendedUnderlays(neighbors, palette);
+  return {
+    map,
+    palette,
+    heights,
+    sceneHeights,
+    blendedUnderlays,
+    regionX,
+    regionZ,
+    buildInfo,
+  };
 }
 
 /**
@@ -166,6 +383,8 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   const atlasInfoBase = {
     cellsPerRow: atlas.manifest.cellsPerRow,
     atlasSize: atlas.manifest.atlasSize,
+    cellSize: atlas.manifest.cellSize,
+    gutter: atlas.manifest.gutter ?? 0,
   };
 
   const perPlane: { positions: number[]; colors: number[]; uvs: number[]; triangleTiles: number[] }[] = [];

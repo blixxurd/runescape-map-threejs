@@ -108,18 +108,22 @@ export interface TriangleSoupOut {
 export interface TileAtlasInfo {
   cellsPerRow: number;
   atlasSize: number;
+  cellSize: number;
+  gutter: number;
   underlayCell: number;
   overlayCell: number;
 }
 
 function cellUV(info: TileAtlasInfo, cell: number, u: number, v: number): [number, number] {
-  const cellU = cell % info.cellsPerRow;
-  const cellV = Math.floor(cell / info.cellsPerRow);
-  const cellFrac = 1 / info.cellsPerRow;
-  const inset = 0.5 / info.atlasSize;
-  const uu = cellU * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, u));
-  const vv = cellV * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, v));
-  return [uu, vv];
+  const slotSize = info.cellSize + 2 * info.gutter;
+  const cellCol = cell % info.cellsPerRow;
+  const cellRow = Math.floor(cell / info.cellsPerRow);
+  const uu = Math.max(0, Math.min(1, u));
+  const vv = Math.max(0, Math.min(1, v));
+  return [
+    (cellCol * slotSize + info.gutter + uu * info.cellSize) / info.atlasSize,
+    (cellRow * slotSize + info.gutter + vv * info.cellSize) / info.atlasSize,
+  ];
 }
 
 /** Midpoint mix — simple RGB average. */

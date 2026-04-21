@@ -128,18 +128,27 @@ export interface DebugOverlayDef {
 
 /**
  * Shared texture atlas for overlay/loc textures. Cells are the same size and
- * arranged in a square grid so UVs are simple: `u ∈ [cellU, cellU+cellSize]`.
+ * arranged in a square grid.
  *
  * A special "solid" cell (always at grid index 0) is a single-color white
  * texture used by all vertices that don't have an overlay texture — the
  * vertex color fully drives their appearance.
+ *
+ * Layout: each grid slot is `(cellSize + 2*gutter)` texels. The center
+ * `cellSize × cellSize` holds the texture; the surrounding `gutter` band is
+ * a wrap-replicated copy of the cell's opposite edges, so mipmap
+ * minification never bleeds in neighboring cells. Baked UVs already skip
+ * the gutter.
  */
 export interface TextureAtlas {
   schemaVersion: 1;
   atlasFile: string; // "atlas.png"
-  atlasSize: number; // pixels square
-  cellSize: number; // pixels square
+  atlasSize: number; // pixels square (= cellsPerRow × (cellSize + 2*gutter))
+  cellSize: number; // pixels square — content area only
   cellsPerRow: number;
+  /** Pixels of wrap-replicated edge padding around each cell. Omit or 0 for
+   *  legacy bundles without gutter. */
+  gutter?: number;
   /** Map from OSRS texture ID → cell index (0..cellsPerRow²). Cell 0 is white. */
   cellByTextureId: Record<number, number>;
   /** Inverse: grid index → texture id (−1 for the white cell and empty cells). */
@@ -170,12 +179,48 @@ export interface LocBlock {
    *  of the footprint; WALL/FLOOR_DEC/ROOF ignore it (1×1 placement). */
   sizeX: number;
   sizeY: number;
+  /** True when `ObjectDefinition.contouredGround != undefined` (opcodes
+   *  21 or 81). The viewer tilts each instance of a contoured block to
+   *  match the terrain's surface normal at its placement tile, so trees,
+   *  rocks, and signs follow slopes instead of floating. */
+  contoured: boolean;
   vertexCount: number;
   positionsByteOffset: number;
   colorsByteOffset: number;
   uvsByteOffset: number;
   bboxMin: [number, number, number];
   bboxMax: [number, number, number];
+  /** Present iff this block is an animated loc. The main `positionsByteOffset`
+   *  in this block already holds frame 0. All other frames live packed in
+   *  `locs.frames.pos.bin` at `framesByteOffset` (Float32 x,y,z × vertexCount
+   *  × frameCount, frame-major). */
+  animation?: LocBlockAnimation;
+}
+
+export interface LocBlockAnimation {
+  /** Total number of frames, including frame 0. Always ≥ 2 (1-frame anims
+   *  don't need animation). */
+  frameCount: number;
+  /** Per-frame duration, in 20-ms "client-frame" units (OSRS's native unit
+   *  for sequence timing). Viewer multiplies by 20 to get milliseconds. */
+  frameTicks: number[];
+  /** Byte offset into `locs.frames.pos.bin`. Layout is frame-major Float32:
+   *  frames × (vertexCount × 3). Frame 0 is duplicated here for simple
+   *  indexing — slight redundancy vs the main blob, tiny cost. */
+  framesByteOffset: number;
+  /** `SequenceDefinition.frameStep` — controls end-of-cycle behaviour.
+   *  Mirrors `LocAnimated.update` in rs-map-viewer (`frame -= frameStep` on
+   *  reaching the end). Three regimes:
+   *    -1 or 0  → animation plays once and freezes on the last frame
+   *               (out-of-range subtraction freezes the loc in the client).
+   *    1..frameCount-1 → after the first full cycle the loop range is
+   *               `[frameCount - frameStep, frameCount)` — i.e. the
+   *               first `frameCount - frameStep` frames are an intro
+   *               played once and the tail loops forever.
+   *    ≥ frameCount → full loop (every cycle replays `[0, frameCount)`).
+   *  We always include this even when it equals frameCount; the viewer
+   *  branches on it. */
+  frameStep: number;
 }
 
 /**
@@ -208,6 +253,10 @@ export interface LocsManifest {
   positionsFile: string; // "locs.pos.bin"
   colorsFile: string; // "locs.col.bin"
   uvsFile: string; // "locs.uv.bin"
+  /** Optional frame-positions blob for animated blocks — only present when
+   *  at least one block has an `animation` field. */
+  framesFile?: string; // "locs.frames.pos.bin"
+  framesByteLength?: number;
   /** loc ids that appeared in placements but could not be resolved (missing from cache). */
   skippedLocIds: number[];
 }

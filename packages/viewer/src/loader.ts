@@ -24,6 +24,10 @@ export interface RegionData {
   locsPositions: Float32Array;
   locsColors: Uint8Array;
   locsUvs: Float32Array;
+  /** Per-frame positions for animated blocks. Frame N of block B lives at
+   *  `block.animation.framesByteOffset / 4 + N × vertexCount × 3`. Empty
+   *  when no animated blocks exist in the region. */
+  locsFramesPositions: Float32Array;
 }
 
 async function fetchBinary(url: string): Promise<ArrayBuffer> {
@@ -54,6 +58,7 @@ export async function loadRegion(regionId: number): Promise<RegionData> {
     locsPosBuf,
     locsColBuf,
     locsUvBuf,
+    locsFramesBuf,
   ] = await Promise.all([
     fetchBinary(`${base}/${terrainMeta.positionsFile}`),
     fetchBinary(`${base}/${terrainMeta.colorsFile}`),
@@ -67,6 +72,9 @@ export async function loadRegion(regionId: number): Promise<RegionData> {
       : Promise.resolve(new ArrayBuffer(0)),
     locs.uvsByteLength > 0
       ? fetchBinary(`${base}/${locs.uvsFile}`)
+      : Promise.resolve(new ArrayBuffer(0)),
+    locs.framesFile
+      ? fetchBinary(`${base}/${locs.framesFile}`)
       : Promise.resolve(new ArrayBuffer(0)),
   ]);
 
@@ -82,5 +90,6 @@ export async function loadRegion(regionId: number): Promise<RegionData> {
     locsPositions: new Float32Array(locsPosBuf),
     locsColors: new Uint8Array(locsColBuf),
     locsUvs: new Float32Array(locsUvBuf),
+    locsFramesPositions: new Float32Array(locsFramesBuf),
   };
 }

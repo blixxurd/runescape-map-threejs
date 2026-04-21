@@ -111,9 +111,47 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
   halves, type 11 (`NORMAL_DIAGIONAL`) resolves to `modelType=10 + rot+4`.
   Rotation (including the `>3` variants with method1194/1206 baked in) is
   stored per block — instance matrices are translation-only.
-- **Single region only.** No streaming, no seam blending between adjacent
-  map squares.
+- **Single region by default, grid-capable.** Viewer loads a
+  `(2·NEIGHBOR_RADIUS + 1)²` square around the URL region; default
+  `NEIGHBOR_RADIUS = 0` in `packages/viewer/src/main.ts` so only the URL
+  region renders. Bump to 1 for a 3×3 grid — missing bundles are skipped
+  with a console warning. The extractor stitches terrain across region
+  seams: heights use the neighbor's (0, z) / (x, 0) corners for the east
+  column / north row, and the 11×11 underlay blend runs on a 74×74 padded
+  scene (center region + 5-tile border from each of the 8 neighbors), so
+  heights and colors both match across adjacent bundles. Contoured-loc
+  vertex sampling also reads the same padded scene heights so
+  tree/fence/rock bases align at the boundary. Full world-scale
+  (streaming, unified atlas): `docs/scaling.md`.
 - **No water / water animation.**
+- **Terrain tile `settings` byte** (render flags): only bit `0x2` (bridge)
+  could plausibly matter at M1 and even that needs a plane-shifted terrain
+  pass. Bits `0x4` (indoor), `0x8` (force-minLevel=0), `0x10`
+  (hide-from-player-level) all feed the client's auto-roof-removal, which
+  needs a player-position feature we haven't built. The raw byte is
+  preserved through the debug JSON so the inspector surfaces it; see
+  `reference/AUDIT.md` → *Tile* and `memory/tile_settings_byte.md` for the
+  exhaustive per-bit writeup.
+- **Contoured-ground scenery follows the slope.** Trees / fences / rocks
+  (`ObjectDefinition.contouredGround`, opcodes 21 & 81) get per-vertex Y
+  deformation baked into a per-placement copy of the block geometry. Trunk
+  bases track the terrain under each vertex; canopies of opcode-81 trees
+  stay rigid above the ratio-space threshold. Details in
+  `memory/osrs_cache_decoding.md`. Cost: contoured blocks can't instance, so
+  each contoured placement emits its own geometry (~2× bundle size for
+  Lumbridge).
+- **Animation.** Scenery locs with `animationID ≥ 0` get every frame
+  of their sequence baked in the extractor (`locs.frames.pos.bin`) and the
+  viewer swaps `BufferGeometry.position` per render tick. Speed matches the
+  client (`frameLengths[i] × 20ms`, 50Hz client-tick clock — RuneLite's
+  `CLIENT_TICK_LENGTH = 20` and rs-map-viewer agree). End-of-cycle behaviour
+  uses `SequenceDefinition.frameStep`: `-1`/`0` → freeze on last frame,
+  `0 < frameStep < frameCount` → tail loop of size `frameStep`, `≥ frameCount`
+  → full loop. Colors / UVs don't re-light per frame, only positions.
+  Diagonal-wall (`bakedRotation ≥ 4`) animated locs fall back to the static
+  pose. All instances of a block animate in lockstep — `randomizeAnimStart`
+  (per-instance random phase) is not implemented, so neighbouring identical
+  animated locs move in sync.
 - **Terrain and loc lighting are both pre-baked** into per-vertex colors
   using the OSRS client's exact algorithms (`Landscape.mixLightness` for
   terrain, `Model.applyLighting` + `method816` for locs). Both meshes

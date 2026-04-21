@@ -19,6 +19,19 @@ import type { TextureAtlas } from "@rsmap/shared";
 
 /** Target cell size; most OSRS ground textures are 128×128. */
 const CELL_SIZE = 128;
+/**
+ * Wrap-replicated edge padding around every cell. Without it, mipmap
+ * minification (enabled in the viewer for zoom-out anti-aliasing) averages
+ * across cell borders and bleeds neighboring textures.
+ *
+ * Clean mips through level log2(GUTTER): with GUTTER=8 that's mip 3 (cell
+ * 16×16, gutter 1), enough for any zoom a user is likely to hit. Beyond
+ * that the cell is tiny and bleed is barely perceptible. OSRS textures are
+ * designed to tile, so wrap-replicating the opposite edge into the gutter
+ * keeps the half-mip texels consistent with the cell content.
+ */
+const GUTTER = 8;
+const SLOT_SIZE = CELL_SIZE + 2 * GUTTER;
 
 interface TextureDef {
   id: number;
@@ -121,23 +134,56 @@ export async function writeAtlas(atlas: BakedAtlas, outDir: string): Promise<voi
  * Build an atlas covering the provided texture ids. Returns the manifest
  * and the PNG file bytes to write to disk.
  */
+/**
+ * Write a cell's pixels plus a wrap-replicated gutter. The gutter takes the
+ * pixel from the *opposite* side of the cell, matching how a tileable
+ * texture would look when sampled with RepeatWrapping — so mipmap
+ * minification sees a coherent continuation rather than a jump into a
+ * neighbor cell.
+ */
+function paintCellWithGutter(
+  ctx: ReturnType<ReturnType<typeof createCanvas>["getContext"]>,
+  slotX: number,
+  slotY: number,
+  rgba: Uint8ClampedArray,
+): void {
+  const padded = new Uint8ClampedArray(SLOT_SIZE * SLOT_SIZE * 4);
+  for (let y = 0; y < SLOT_SIZE; y++) {
+    // Wrap so y<GUTTER pulls from the bottom rows, y>=GUTTER+CELL_SIZE from the top.
+    const sy = ((y - GUTTER) % CELL_SIZE + CELL_SIZE) % CELL_SIZE;
+    for (let x = 0; x < SLOT_SIZE; x++) {
+      const sx = ((x - GUTTER) % CELL_SIZE + CELL_SIZE) % CELL_SIZE;
+      const si = (sy * CELL_SIZE + sx) * 4;
+      const di = (y * SLOT_SIZE + x) * 4;
+      padded[di + 0] = rgba[si + 0]!;
+      padded[di + 1] = rgba[si + 1]!;
+      padded[di + 2] = rgba[si + 2]!;
+      padded[di + 3] = rgba[si + 3]!;
+    }
+  }
+  const img = ctx.createImageData(SLOT_SIZE, SLOT_SIZE);
+  img.data.set(padded);
+  ctx.putImageData(img, slotX, slotY);
+}
+
 export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): Promise<BakedAtlas> {
   const ids = [...new Set(textureIds)].sort((a, b) => a - b);
   // +1 for the solid white cell at index 0.
   const cellCount = ids.length + 1;
   const cellsPerRow = Math.max(1, Math.ceil(Math.sqrt(cellCount)));
-  const atlasSize = cellsPerRow * CELL_SIZE;
+  const atlasSize = cellsPerRow * SLOT_SIZE;
 
-  console.log(`[tex] atlas: ${cellCount} cells (${cellsPerRow}×${cellsPerRow} grid, ${atlasSize}×${atlasSize}px)`);
+  console.log(
+    `[tex] atlas: ${cellCount} cells (${cellsPerRow}×${cellsPerRow} grid, cell ${CELL_SIZE}px + ${GUTTER}px gutter = ${SLOT_SIZE}px slot, ${atlasSize}×${atlasSize}px total)`,
+  );
 
   const canvas = createCanvas(atlasSize, atlasSize);
   const ctx = canvas.getContext("2d");
 
-  // Cell 0: solid white.
+  // Cell 0: solid white. Gutter is also solid white — wrap of a constant is
+  // still the constant.
   const white = new Uint8ClampedArray(CELL_SIZE * CELL_SIZE * 4).fill(255);
-  const whiteImg = ctx.createImageData(CELL_SIZE, CELL_SIZE);
-  whiteImg.data.set(white);
-  ctx.putImageData(whiteImg, 0, 0);
+  paintCellWithGutter(ctx, 0, 0, white);
 
   const cellByTextureId: Record<number, number> = {};
   const textureIdByCell: number[] = new Array(cellsPerRow * cellsPerRow).fill(-1);
@@ -147,11 +193,9 @@ export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): 
   for (const id of ids) {
     const rgba = await fetchTexturePixels(cache, id);
     if (!rgba) continue;
-    const cx = (nextCell % cellsPerRow) * CELL_SIZE;
-    const cy = Math.floor(nextCell / cellsPerRow) * CELL_SIZE;
-    const img = ctx.createImageData(CELL_SIZE, CELL_SIZE);
-    img.data.set(rgba);
-    ctx.putImageData(img, cx, cy);
+    const slotX = (nextCell % cellsPerRow) * SLOT_SIZE;
+    const slotY = Math.floor(nextCell / cellsPerRow) * SLOT_SIZE;
+    paintCellWithGutter(ctx, slotX, slotY, rgba);
     cellByTextureId[id] = nextCell;
     textureIdByCell[nextCell] = id;
     nextCell++;
@@ -167,6 +211,7 @@ export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): 
       atlasSize,
       cellSize: CELL_SIZE,
       cellsPerRow,
+      gutter: GUTTER,
       cellByTextureId,
       textureIdByCell,
     },
@@ -176,7 +221,8 @@ export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): 
 
 /**
  * Helper to turn a cell index + (u, v) within-cell into absolute atlas UVs.
- * u, v are both in [0, 1] for "within this texture".
+ * u, v are both in [0, 1] for "within this texture". Maps into the
+ * cellSize-texel center of the slot, skipping the surrounding gutter.
  */
 export function cellUV(
   atlas: TextureAtlas,
@@ -184,12 +230,14 @@ export function cellUV(
   u: number,
   v: number,
 ): [number, number] {
-  const cellU = cell % atlas.cellsPerRow;
-  const cellV = Math.floor(cell / atlas.cellsPerRow);
-  const cellFrac = 1 / atlas.cellsPerRow;
-  // Inset by half a texel so linear filtering doesn't bleed adjacent cells.
-  const inset = 0.5 / atlas.atlasSize;
-  const uu = cellU * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, u));
-  const vv = cellV * cellFrac + inset + (cellFrac - 2 * inset) * Math.max(0, Math.min(1, v));
-  return [uu, vv];
+  const gutter = atlas.gutter ?? 0;
+  const slotSize = atlas.cellSize + 2 * gutter;
+  const cellCol = cell % atlas.cellsPerRow;
+  const cellRow = Math.floor(cell / atlas.cellsPerRow);
+  const uu = Math.max(0, Math.min(1, u));
+  const vv = Math.max(0, Math.min(1, v));
+  return [
+    (cellCol * slotSize + gutter + uu * atlas.cellSize) / atlas.atlasSize,
+    (cellRow * slotSize + gutter + vv * atlas.cellSize) / atlas.atlasSize,
+  ];
 }

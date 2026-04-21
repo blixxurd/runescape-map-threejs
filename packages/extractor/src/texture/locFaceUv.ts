@@ -142,8 +142,8 @@ export function computeFaceUv(model: ModelLike, faceIndex: number): [number, num
 
 /**
  * Map a texture-local UV (both in [0, 1]) to absolute atlas UVs for the
- * given cell. Inset by half a texel so linear filtering never bleeds into
- * adjacent cells.
+ * given cell. Each slot holds `cellSize × cellSize` content wrapped by a
+ * `gutter`-wide band; UVs map into the content area only.
  *
  * UVs outside [0, 1] are **clamped**, not wrapped. Atlases don't compose
  * with `RepeatWrapping` — wrapping would jump to the opposite edge of the
@@ -155,18 +155,19 @@ export function computeFaceUv(model: ModelLike, faceIndex: number): [number, num
 export function cellUV(
   atlasSize: number,
   cellsPerRow: number,
+  cellSize: number,
+  gutter: number,
   cell: number,
   u: number,
   v: number,
 ): [number, number] {
+  const slotSize = cellSize + 2 * gutter;
   const cellCol = cell % cellsPerRow;
   const cellRow = Math.floor(cell / cellsPerRow);
-  const cellFrac = 1 / cellsPerRow;
-  const inset = 0.5 / atlasSize;
   const uu = Math.max(0, Math.min(1, u));
   const vv = Math.max(0, Math.min(1, v));
   return [
-    cellCol * cellFrac + inset + (cellFrac - 2 * inset) * uu,
-    cellRow * cellFrac + inset + (cellFrac - 2 * inset) * vv,
+    (cellCol * slotSize + gutter + uu * cellSize) / atlasSize,
+    (cellRow * slotSize + gutter + vv * cellSize) / atlasSize,
   ];
 }

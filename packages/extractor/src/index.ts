@@ -85,9 +85,13 @@ async function extractRegion(regionId: number, requestedBuild?: number): Promise
     await writeAtlas(atlas, outDir);
 
     // Phase 3: emit both geometries with UVs keyed to the final atlas.
+    // Locs emission consumes `terrainPlan.sceneHeights` — a 74×74 padded
+    // grid that includes a 5-tile ring from each neighbor — so contoured
+    // locs (fences, trees, rocks) sample terrain correctly even when their
+    // geometry extends past the region edge into a neighbor.
     const terrain = emitTerrain(terrainPlan, atlas);
     await writeTerrainBundle(terrain, outDir);
-    const locs = emitLocs(locsPlan, atlas);
+    const locs = emitLocs(locsPlan, atlas, terrainPlan.sceneHeights);
     await writeLocsBundle(locs, outDir);
 
     const failures = getObjectLoaderFailureCount();
@@ -125,4 +129,7 @@ sade("extract", true)
       process.exit(1);
     });
   })
-  .parse(process.argv);
+  // pnpm forwards a literal `--` separator when you run `pnpm extract -- --region N`,
+  // and sade treats `--` as "stop parsing options", silently falling back to
+  // the default region. Drop any bare `--` so both invocation styles work.
+  .parse(process.argv.filter((a) => a !== "--"));

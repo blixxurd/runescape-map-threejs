@@ -101,6 +101,9 @@ declare module "osrscachereader" {
     objectModels: number[] | null;
     sizeX: number;
     sizeY: number;
+    ambient?: number;
+    contrast?: number;
+    contouredGround?: number;
     modelSizeX: number;
     modelSizeHeight: number;
     modelSizeY: number;
@@ -115,7 +118,44 @@ declare module "osrscachereader" {
     recolorToReplace?: number[];
     retextureToFind?: number[];
     textureToReplace?: number[];
+    animationID?: number;
+    shadow?: boolean;
+    decorDisplacement?: number;
+    obstructsGround?: boolean;
+    varbitID?: number;
+    varpID?: number;
     getModel(cache: RSCache, modelType: number, rotation: number): Promise<ModelDefinition | null>;
+  }
+
+  export interface SequenceDefinition {
+    id: number;
+    name?: string;
+    frameLengths: number[];
+    frameIDs: number[];
+    frameStep: number;
+  }
+
+  /** Per-group animation skeleton: `frameMaps[g]` is the list of vertex-skin
+   *  labels that belong to group `g`; `types[g]` is the transform opcode
+   *  (0=origin, 1=translate, 2=rotate, 3=scale, 5=alpha, 7=light) that frames
+   *  apply to group `g`. */
+  export interface FramemapDefinition {
+    id: number;
+    length: number;
+    types: number[];
+    frameMaps: number[][];
+  }
+
+  export interface FramesDefinition {
+    id: number;
+    framemap: FramemapDefinition;
+    indexFrameIds: number[];
+    translator_x: number[];
+    translator_y: number[];
+    translator_z: number[];
+    translatorCount: number;
+    showing?: boolean;
+    colorTransform?: boolean;
   }
 
   export interface ModelDefinition {
@@ -153,6 +193,19 @@ declare module "osrscachereader" {
     numTextureFaces?: number;
     faceCount: number;
     vertexCount: number;
+    /** Per-vertex animation skin label (0..255 as a byte). ONLY populated
+     *  during cache decode — `computeAnimationTables` nulls this out after
+     *  building `vertexGroups`. Don't rely on it post-load. */
+    vertexSkins?: number[] | null;
+    /** Pre-built reverse lookup: `vertexGroups[label] = [vertexIdx...]`.
+     *  This is what animation frames actually index into — the framemap's
+     *  `frameMaps[groupIdx]` array is a list of labels, each resolving
+     *  to a list of vertices here. */
+    vertexGroups?: number[][];
+    /** Per-face animation skin label — same lifetime as vertexSkins. */
+    faceSkins?: number[] | null;
+    /** Post-decode reverse lookup for face alpha transforms. */
+    faceLabelsAlpha?: number[][];
     // a bunch of method1xxx/resize/recolor etc we don't call directly
   }
 

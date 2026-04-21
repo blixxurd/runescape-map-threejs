@@ -5,3 +5,5 @@ dist/
 *.log
 packages/viewer/public/regions/
 reference/
+.claude/
+packages/extractor/src/scratch/
