@@ -1,6 +1,7 @@
 import sade from "sade";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { RSCache } from "osrscachereader";
 import { ensureCache, resolveCache, type CacheMeta } from "./download.js";
 import {
@@ -26,12 +27,17 @@ import { patchFloorLoaders } from "./patches/floorLoaders.js";
  * then extracts a single 64×64 map square into a triangle-soup bundle that
  * the viewer loads as-is.
  *
+ * The extraction core is also exported (`openExtractorSession`,
+ * `extractRegion`) so the Vite dev server can call it in-process when the
+ * viewer hits a missing region bundle — same pipeline, just no child
+ * process.
+ *
  * Region IDs: `(regionX << 8) | regionZ`. Default = 12850 (Lumbridge).
  */
 
-const REPO_ROOT = resolve(import.meta.dirname, "../../..");
-const CACHE_DIR = join(REPO_ROOT, ".cache");
-const VIEWER_REGIONS = join(REPO_ROOT, "packages/viewer/public/regions");
+export const REPO_ROOT = resolve(import.meta.dirname, "../../..");
+export const CACHE_DIR = join(REPO_ROOT, ".cache");
+export const VIEWER_REGIONS = join(REPO_ROOT, "packages/viewer/public/regions");
 
 /**
  * Project default: build 234 (Oct 2025). Picked because it's the most recent
@@ -40,14 +46,39 @@ const VIEWER_REGIONS = join(REPO_ROOT, "packages/viewer/public/regions");
  * so we don't lose locs to parse failures. Override with --build to experiment.
  * See memory/osrs_cache_decoding.md for the reasoning.
  */
-const DEFAULT_BUILD = 234;
+export const DEFAULT_BUILD = 234;
 
-async function extractRegion(regionId: number, requestedBuild?: number): Promise<void> {
+/** Thrown when a region id has no map data in the cache (ocean / off-map). */
+export class NoSuchRegionError extends Error {
+  constructor(
+    public readonly regionX: number,
+    public readonly regionZ: number,
+  ) {
+    super(`No map data for region (${regionX}, ${regionZ})`);
+    this.name = "NoSuchRegionError";
+  }
+}
+
+/**
+ * A loaded OSRS cache + its metadata. Opening the cache is expensive
+ * (index load, XTEA setup), so callers that want to extract multiple
+ * regions should open one session and pass it into `extractRegion`
+ * repeatedly. The CLI opens a throwaway session per invocation.
+ */
+export interface ExtractorSession {
+  readonly rs: RSCache;
+  readonly cacheMeta: CacheMeta;
+  close(): void;
+}
+
+/**
+ * Boots the extractor: applies library patches, resolves the openrs2 cache
+ * snapshot for `build`, downloads it if missing, opens an `RSCache`. The
+ * returned session must be `close()`d when the caller is done.
+ */
+export async function openExtractorSession(requestedBuild?: number): Promise<ExtractorSession> {
   await patchObjectLoader();
   await patchFloorLoaders();
-  const regionX = (regionId >> 8) & 0xff;
-  const regionZ = regionId & 0xff;
-  console.log(`[extract] region ${regionId} = (${regionX}, ${regionZ})`);
 
   const build = requestedBuild ?? DEFAULT_BUILD;
   const cacheMeta: CacheMeta = await resolveCache({ build });
@@ -60,76 +91,126 @@ async function extractRegion(regionId: number, requestedBuild?: number): Promise
 
   console.log(`[extract] opening cache at ${cacheDir}`);
   const rs = new RSCache(cacheDir);
+  await rs.onload;
+
+  return {
+    rs,
+    cacheMeta,
+    close() {
+      rs.close();
+    },
+  };
+}
+
+/**
+ * Extracts one region into `packages/viewer/public/regions/<id>/` using an
+ * already-open session. Throws `NoSuchRegionError` when the region has no
+ * map data — callers (the viewer middleware) should treat that as 404 and
+ * not a 500.
+ */
+export async function extractRegion(
+  regionId: number,
+  session: ExtractorSession,
+): Promise<{ outDir: string }> {
+  const regionX = (regionId >> 8) & 0xff;
+  const regionZ = regionId & 0xff;
+  console.log(`[extract] region ${regionId} = (${regionX}, ${regionZ})`);
+
+  const outDir = join(VIEWER_REGIONS, String(regionId));
+  mkdirSync(outDir, { recursive: true });
+
+  // Phase 1: resolve both pipelines in parallel (they don't yet know atlas).
+  // prepareTerrain is what reports a missing region; translate the generic
+  // Error into the tagged class so the middleware can answer 404.
+  let terrainPlan, locsPlan;
   try {
-    await rs.onload;
-
-    const outDir = join(VIEWER_REGIONS, String(regionId));
-    mkdirSync(outDir, { recursive: true });
-
-    // Phase 1: resolve both pipelines in parallel (they don't yet know atlas).
-    const [terrainPlan, locsPlan] = await Promise.all([
-      prepareTerrain(rs, regionX, regionZ, {
-        buildId: cacheMeta.build,
-        sourceCacheId: cacheMeta.id,
+    [terrainPlan, locsPlan] = await Promise.all([
+      prepareTerrain(session.rs, regionX, regionZ, {
+        buildId: session.cacheMeta.build,
+        sourceCacheId: session.cacheMeta.id,
       }),
-      prepareLocs(rs, regionX, regionZ),
+      prepareLocs(session.rs, regionX, regionZ),
     ]);
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("No map data for region")) {
+      throw new NoSuchRegionError(regionX, regionZ);
+    }
+    throw err;
+  }
 
-    // Phase 2: build one atlas over every textureId referenced anywhere.
-    const textureIds = new Set<number>([
-      ...collectTerrainTextureIds(terrainPlan),
-      ...collectLocsTextureIds(locsPlan),
-    ]);
-    console.log(`[atlas] ${textureIds.size} unique textures (terrain + locs)`);
-    const atlas = await buildAtlas(rs, textureIds);
-    await writeAtlas(atlas, outDir);
+  // Phase 2: build one atlas over every textureId referenced anywhere.
+  const textureIds = new Set<number>([
+    ...collectTerrainTextureIds(terrainPlan),
+    ...collectLocsTextureIds(locsPlan),
+  ]);
+  console.log(`[atlas] ${textureIds.size} unique textures (terrain + locs)`);
+  const atlas = await buildAtlas(session.rs, textureIds);
+  await writeAtlas(atlas, outDir);
 
-    // Phase 3: emit both geometries with UVs keyed to the final atlas.
-    // Locs emission consumes `terrainPlan.sceneHeights` — a 74×74 padded
-    // grid that includes a 5-tile ring from each neighbor — so contoured
-    // locs (fences, trees, rocks) sample terrain correctly even when their
-    // geometry extends past the region edge into a neighbor.
-    const terrain = emitTerrain(terrainPlan, atlas);
-    await writeTerrainBundle(terrain, outDir);
-    const locs = emitLocs(locsPlan, atlas, terrainPlan.sceneHeights);
-    await writeLocsBundle(locs, outDir);
+  // Phase 3: emit both geometries with UVs keyed to the final atlas.
+  // Locs emission consumes `terrainPlan.sceneHeights` — a 74×74 padded
+  // grid that includes a 5-tile ring from each neighbor — so contoured
+  // locs (fences, trees, rocks) sample terrain correctly even when their
+  // geometry extends past the region edge into a neighbor.
+  const terrain = emitTerrain(terrainPlan, atlas);
+  await writeTerrainBundle(terrain, outDir);
+  const locs = emitLocs(locsPlan, atlas, terrainPlan.sceneHeights);
+  await writeLocsBundle(locs, outDir);
 
-    const failures = getObjectLoaderFailureCount();
-    console.log(
-      `[extract] done → ${outDir}` +
-        (failures > 0 ? `  (⚠ ${failures} ObjectLoader parse failures — older cache build may be cleaner)` : `  (✓ 0 parse failures)`),
-    );
+  const failures = getObjectLoaderFailureCount();
+  console.log(
+    `[extract] done → ${outDir}` +
+      (failures > 0
+        ? `  (⚠ ${failures} ObjectLoader parse failures — older cache build may be cleaner)`
+        : `  (✓ 0 parse failures)`),
+  );
+
+  return { outDir };
+}
+
+async function runCli(regionId: number, requestedBuild?: number): Promise<void> {
+  const session = await openExtractorSession(requestedBuild);
+  try {
+    await extractRegion(regionId, session);
   } finally {
-    rs.close();
+    session.close();
   }
 }
 
-sade("extract", true)
-  .describe("Extract one OSRS region into a Three.js-ready bundle.")
-  .option("-r, --region", "Region id (regionX<<8 | regionZ). Default 12850 (Lumbridge).", 12850)
-  .option("-b, --build", `OSRS build number. Default ${DEFAULT_BUILD} (library-compatible).`)
-  .action((opts: { region: number | string; build?: number | string }) => {
-    const regionId = typeof opts.region === "string" ? parseInt(opts.region, 10) : opts.region;
-    if (!Number.isInteger(regionId) || regionId < 0 || regionId > 0xffff) {
-      console.error(`Invalid region id: ${opts.region}`);
-      process.exit(1);
-    }
-    const build =
-      opts.build === undefined
-        ? undefined
-        : typeof opts.build === "string"
-          ? parseInt(opts.build, 10)
-          : opts.build;
-    if (build !== undefined && !Number.isInteger(build)) {
-      console.error(`Invalid build: ${opts.build}`);
-      process.exit(1);
-    }
-    extractRegion(regionId, build).catch((e: unknown) => {
-      console.error("[extract] failed:", e);
-      process.exit(1);
-    });
-  })
-  // pnpm forwards a literal `--` separator when you run `pnpm extract -- --region N`,
-  // and sade treats `--` as "stop parsing options", silently falling back to
-  // the default region. Drop any bare `--` so both invocation styles work.
-  .parse(process.argv.filter((a) => a !== "--"));
+// Only run as a CLI when invoked directly (e.g. `tsx src/index.ts`). When
+// imported by the Vite middleware we skip sade entirely.
+const invokedAsCli =
+  process.argv[1] !== undefined &&
+  process.argv[1] === fileURLToPath(import.meta.url);
+
+if (invokedAsCli) {
+  sade("extract", true)
+    .describe("Extract one OSRS region into a Three.js-ready bundle.")
+    .option("-r, --region", "Region id (regionX<<8 | regionZ). Default 12850 (Lumbridge).", 12850)
+    .option("-b, --build", `OSRS build number. Default ${DEFAULT_BUILD} (library-compatible).`)
+    .action((opts: { region: number | string; build?: number | string }) => {
+      const regionId = typeof opts.region === "string" ? parseInt(opts.region, 10) : opts.region;
+      if (!Number.isInteger(regionId) || regionId < 0 || regionId > 0xffff) {
+        console.error(`Invalid region id: ${opts.region}`);
+        process.exit(1);
+      }
+      const build =
+        opts.build === undefined
+          ? undefined
+          : typeof opts.build === "string"
+            ? parseInt(opts.build, 10)
+            : opts.build;
+      if (build !== undefined && !Number.isInteger(build)) {
+        console.error(`Invalid build: ${opts.build}`);
+        process.exit(1);
+      }
+      runCli(regionId, build).catch((e: unknown) => {
+        console.error("[extract] failed:", e);
+        process.exit(1);
+      });
+    })
+    // pnpm forwards a literal `--` separator when you run `pnpm extract -- --region N`,
+    // and sade treats `--` as "stop parsing options", silently falling back to
+    // the default region. Drop any bare `--` so both invocation styles work.
+    .parse(process.argv.filter((a) => a !== "--"));
+}

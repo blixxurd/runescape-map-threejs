@@ -77,6 +77,17 @@ export class DebugInspector {
     this.installListeners();
   }
 
+  /**
+   * Register a region loaded after construction — used by the streaming
+   * loader in main.ts. No-op if already present (region ids are unique
+   * and stable).
+   */
+  addRegion(info: RegionInfo): void {
+    if (this.regionsById.has(info.regionId)) return;
+    this.regionsById.set(info.regionId, info);
+    this.raycastTargets.push(info.terrainGroup, info.locsGroup);
+  }
+
   private installListeners(): void {
     const dom = this.refs.renderer.domElement;
     window.addEventListener("keydown", (e) => {
@@ -208,8 +219,18 @@ export class DebugInspector {
     }
 
     const obj = hit.object;
+    // Three mesh variants live in the scene and they all extend Mesh, so the
+    // dispatch order matters:
+    //   1. InstancedMesh → a still-instanced loc block (animated or
+    //      multi-instance).
+    //   2. Plain Mesh with `userData.isMergedLocs` → one of the per-plane
+    //      merged singleton-loc meshes. Resolve via `placementByTri` since
+    //      there's no instanceId to look up.
+    //   3. Plain Mesh → terrain (one per plane per region).
     if (obj instanceof THREE.InstancedMesh) {
       this.renderLocHit(hit, region, cached);
+    } else if ((obj.userData as { isMergedLocs?: boolean }).isMergedLocs) {
+      this.renderMergedLocHit(hit, region, cached);
     } else if (obj instanceof THREE.Mesh) {
       this.renderTerrainHit(hit, region, cached);
     } else {
@@ -295,11 +316,61 @@ export class DebugInspector {
       this.panel.innerHTML = `<span class="k">loc:</span> ${inst.name}`;
       return;
     }
-    const placement = region.locsManifest.placements[placementIdxs[instanceId] ?? -1];
+    const placementIdx = placementIdxs[instanceId] ?? -1;
+    this.renderLocByPlacement(
+      placementIdx,
+      region,
+      bundle,
+      `${instanceId} / ${inst.count}`,
+    );
+  }
+
+  /**
+   * Merged-loc hits have no `instanceId` — instead each triangle in the
+   * merged mesh remembers the placement it came from, stored on userData
+   * at build time. Look up faceIndex → placement, then reuse the shared
+   * loc renderer.
+   */
+  private renderMergedLocHit(
+    hit: THREE.Intersection,
+    region: RegionInfo,
+    bundle: LoadedDebugBundle,
+  ): void {
+    const mesh = hit.object;
+    const map = (mesh.userData as { placementByTri?: Uint32Array }).placementByTri;
+    const faceIdx = hit.faceIndex;
+    if (!map || faceIdx === undefined || faceIdx === null) {
+      this.panel.innerHTML = `<span class="k">loc (merged):</span> ${mesh.name}`;
+      this.lastPasteBlock = null;
+      return;
+    }
+    const placementIdx = map[faceIdx] ?? -1;
+    this.renderLocByPlacement(placementIdx, region, bundle, "merged");
+  }
+
+  /**
+   * Shared loc-panel renderer. Takes a fully resolved placement index and
+   * an opaque "instance label" to show in the UI (`"3 / 12"` for instanced,
+   * `"merged"` for merged). Kept out of `renderLocHit` / `renderMergedLocHit`
+   * so those two paths can't drift apart.
+   */
+  private renderLocByPlacement(
+    placementIdx: number,
+    region: RegionInfo,
+    bundle: LoadedDebugBundle,
+    instanceLabel: string,
+  ): void {
+    const placement = region.locsManifest.placements[placementIdx];
+    if (!placement) {
+      this.panel.innerHTML = `<span class="k">loc:</span> no placement at ${placementIdx}`;
+      this.lastPasteBlock = null;
+      return;
+    }
+    const blockIdx = placement.blockIndex;
     const block = region.locsManifest.blocks[blockIdx];
     const dbg = bundle.locsDebug.blocks[blockIdx];
-    if (!placement || !block) {
-      this.panel.innerHTML = `<span class="k">loc:</span> ${inst.name} instance=${instanceId}`;
+    if (!block) {
+      this.panel.innerHTML = `<span class="k">loc:</span> placement=${placementIdx} no block`;
       this.lastPasteBlock = null;
       return;
     }
@@ -329,14 +400,14 @@ export class DebugInspector {
 <span class="k">tile:</span> <span class="v">(${placement.x}, ${placement.z})</span>  <span class="k">plane:</span> <span class="v">${placement.plane}</span>
 <span class="k">cache type:</span> <span class="v">${placement.origType}</span> (${origTypeName})  <span class="k">rot:</span> <span class="v">${placement.origRotation}</span>
 <span class="k">model type:</span> <span class="v">${block.modelType}</span> (${modelTypeName})  <span class="k">baked rot:</span> <span class="v">${block.bakedRotation}</span>
-<span class="k">block:</span> <span class="v">${blockIdx}</span>  <span class="k">instance:</span> <span class="v">${instanceId} / ${inst.count}</span>
+<span class="k">block:</span> <span class="v">${blockIdx}</span>  <span class="k">instance:</span> <span class="v">${instanceLabel}</span>
 <span class="k">faces:</span> <span class="v">${dbg?.faceCount ?? "?"}</span>  <span class="k">textured:</span> <span class="v">${dbg?.texturedFaceCount ?? "?"}</span>  <span class="k">distinctColors:</span> <span class="v">${dbg?.distinctFaceColors ?? "?"}</span>${animLine ? `\n<span class="k">animation:</span> <span class="v">${block.animation!.frameCount} frames</span>  <span class="k">ticks:</span> <span class="v">[${block.animation!.frameTicks.join(",")}]</span>  <span class="k">frameStep:</span> <span class="v">${block.animation!.frameStep}</span>` : ""}`;
 
     this.lastPasteBlock = [
       `[region ${region.regionId} / loc]`,
       `locId=${block.locId}${dbg?.name ? `  "${dbg.name}"` : ""}  tile=(${placement.x}, ${placement.z})  plane=${placement.plane}`,
       `cache: type=${placement.origType} (${origTypeName})  rot=${placement.origRotation}`,
-      `model: type=${block.modelType} (${modelTypeName})  bakedRot=${block.bakedRotation}  block=${blockIdx}  instance=${instanceId}/${inst.count}`,
+      `model: type=${block.modelType} (${modelTypeName})  bakedRot=${block.bakedRotation}  block=${blockIdx}  instance=${instanceLabel}`,
       `geometry: faces=${dbg?.faceCount ?? "?"}  textured=${dbg?.texturedFaceCount ?? "?"}  distinctColors=${dbg?.distinctFaceColors ?? "?"}${animLine}`,
       `bundle: build=${region.terrainMeta.buildId} cache=${region.terrainMeta.sourceCacheId}`,
     ].join("\n");

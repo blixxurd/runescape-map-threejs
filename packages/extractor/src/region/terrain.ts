@@ -299,7 +299,17 @@ export async function prepareTerrain(
   buildInfo: { buildId: number; sourceCacheId: number },
 ): Promise<TerrainPlan> {
   console.log(`[terrain] getMap(${regionX}, ${regionZ})`);
-  const map = await cache.getMap(regionX, regionZ);
+  // `osrscachereader` throws an opaque "reading 'id'" error from deep
+  // inside `getMap` when the region's archive is missing (off-map ids,
+  // ocean squares). Treat any throw AND the null-ish return paths as
+  // "no map data" so the middleware can answer 404 instead of 500.
+  let map: MapDefinition | null | undefined;
+  try {
+    map = await cache.getMap(regionX, regionZ);
+  } catch (e) {
+    console.warn(`[terrain] getMap failed: ${(e as Error).message}`);
+    throw new Error(`No map data for region (${regionX}, ${regionZ})`);
+  }
   if (!map || !map.tiles || !map.tiles[0]) {
     throw new Error(`No map data for region (${regionX}, ${regionZ})`);
   }
@@ -455,9 +465,30 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
         // 20 give 4.5 → +1 = 5.5 → `TILE_SHAPE_FACES[5.5]` is undefined →
         // we silently fell back to shape 0 = pure underlay.
         const rotation = tile.overlayRotation ?? 0;
-        const overlayId = tile.overlayId ?? 0;
-        const hasOverlay = overlayId > 0;
+        const overlayIdRaw = tile.overlayId ?? 0;
         const underlayId = tile.underlayId ?? 0;
+
+        // Magenta-sentinel overlays (raw RGB = 0xFF00FF) mean "invisible
+        // overlay" in the OSRS client (Landscape.java line 526, cross-checked
+        // against rs-map-viewer's SceneBuilder which reads `primaryRgb`). The
+        // library's OverlayLoader packs `color` into HSL16 before we see it,
+        // and its buggy `readInt24` sign-extends the low byte so 0xFF00FF
+        // reads back as -1 (indistinguishable from 0xFFFFFF). Our
+        // `floorLoaders.ts` patch reads three unsigned bytes directly and
+        // preserves the clean uint24 in `rawPrimaryRgb`, which is what we
+        // compare here. Treating the sentinel as "no overlay" lets the
+        // underlay render through (matching the client) and — when the tile
+        // has no underlay either — skips the tile entirely, which is how the
+        // real "empty air on plane > 0" tiles end up invisible.
+        const odefEarly = overlayIdRaw > 0 ? palette.overlays.get(overlayIdRaw) : undefined;
+        const overlayIsMagentaSentinel = odefEarly?.rawPrimaryRgb === 0xff00ff;
+        const overlayId = overlayIsMagentaSentinel ? 0 : overlayIdRaw;
+        const hasOverlay = overlayId > 0;
+
+        // With both overlay and underlay gone (pure sentinel on empty-plane
+        // tile) there's nothing to draw — the client skips these entirely.
+        if (!hasOverlay && underlayId === 0) continue;
+
         const shape = hasOverlay ? Math.floor(tile.overlayPath ?? 0) + 1 : 0;
 
         // Atlas cells for this tile: underlay-side and overlay-side.
@@ -625,7 +656,10 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   for (const [id, o] of palette.overlays) {
     debugOverlays[id] = {
       id,
-      rawRgb: 0, // not captured by library for overlays; leave as 0
+      // Library doesn't keep raw RGB on overlays by default; our floorLoaders
+      // patch captures it into `rawPrimaryRgb`. Fall back to 0 when missing
+      // (e.g. overlay has no opcode 1 and is texture-only).
+      rawRgb: o.rawPrimaryRgb ?? 0,
       packedHsl: o.color,
       textureId: o.texture,
       hideUnderlay: o.hideUnderlay,

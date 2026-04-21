@@ -43,7 +43,16 @@ export async function patchObjectLoader(): Promise<void> {
   const loaderPath = mainPath.replace(/index\.js$/, "cacheReader/loaders/ObjectLoader.js");
   const url = pathToFileURL(loaderPath).href;
 
-  const mod = (await import(url)) as {
+  // Use `Function("return import(url)")` to hide the dynamic import from
+  // Vite's SSR transform. Vite rewrites every `import()` it can see into a
+  // call through its own module graph, which then can't resolve a plain
+  // `file://` URL pointing into `node_modules`. Wrapping in `new Function`
+  // keeps the import opaque to the transform — Node's native ESM loader
+  // handles the URL unchanged at runtime. The `@vite-ignore` comment is
+  // insufficient here because it only suppresses the warning, not the
+  // rewrite.
+  const nativeImport = new Function("url", "return import(url)") as (u: string) => Promise<unknown>;
+  const mod = (await nativeImport(url)) as {
     default: new () => { load: (b: Uint8Array, id: number) => unknown };
     ObjectDefinition: new () => DefLike;
   };

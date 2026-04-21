@@ -32,6 +32,21 @@ interface RsDataView {
   setPosition(pos: number): void;
 }
 
+/**
+ * Reads an unsigned 24-bit RGB value (hi→lo). The library's `readInt24`
+ * composes three bytes via `(getInt16 << 8) | getInt8`, but `getInt8`
+ * sign-extends a 0xFF low byte to 0xFFFFFFFF, clobbering the high bytes in
+ * the OR. That makes e.g. 0xFF00FF (magenta, the invisible-overlay
+ * sentinel) indistinguishable from 0xFFFFFF (white) — both come back as
+ * `-1`. Reading three unsigned bytes directly gives a clean uint24.
+ */
+function readUint24(dv: RsDataView): number {
+  const b0 = dv.readUint8();
+  const b1 = dv.readUint8();
+  const b2 = dv.readUint8();
+  return ((b0 << 16) | (b1 << 8) | b2) >>> 0;
+}
+
 interface UnderlayDef {
   id: number;
   color?: number;
@@ -56,6 +71,10 @@ interface OverlayDef {
   textureSize?: number;
   blockShadow?: boolean;
   name?: string;
+  /** Raw 0xRRGGBB captured before the library's `convertToHsl` overwrites
+   *  `def.color` with the HSL16 pack. Used to detect the magenta (0xFF00FF)
+   *  "invisible overlay" sentinel that the OSRS client honors. */
+  rawPrimaryRgb?: number;
 }
 
 let patched = false;
@@ -66,7 +85,11 @@ export async function patchFloorLoaders(): Promise<void> {
   const toUrl = (file: string): string =>
     pathToFileURL(mainPath.replace(/index\.js$/, file)).href;
 
-  const underlayMod = (await import(toUrl("cacheReader/loaders/UnderlayLoader.js"))) as {
+  // See objectLoader.ts for why we wrap `import()` in `new Function`: it
+  // hides the call from Vite's SSR transform so a plain `file://` URL
+  // reaches Node's native ESM loader intact.
+  const nativeImport = new Function("url", "return import(url)") as (u: string) => Promise<unknown>;
+  const underlayMod = (await nativeImport(toUrl("cacheReader/loaders/UnderlayLoader.js"))) as {
     default: new () => {
       handleOpcode: (def: UnderlayDef, opcode: number, dv: RsDataView) => void;
       loadHsl: (def: UnderlayDef) => void;
@@ -74,7 +97,7 @@ export async function patchFloorLoaders(): Promise<void> {
       load: (bytes: Uint8Array, id: number) => UnderlayDef;
     };
   };
-  const overlayMod = (await import(toUrl("cacheReader/loaders/OverlayLoader.js"))) as {
+  const overlayMod = (await nativeImport(toUrl("cacheReader/loaders/OverlayLoader.js"))) as {
     default: new () => {
       handleOpcode: (def: OverlayDef, opcode: number, dv: RsDataView) => void;
     };
@@ -88,7 +111,7 @@ export async function patchFloorLoaders(): Promise<void> {
   ): void {
     if (opcode === 0) return;
     if (opcode === 1) {
-      const rgb = dv.readInt24();
+      const rgb = readUint24(dv);
       def.color = rgb;
       def.rawRgb = rgb;
     } else if (opcode === 2) {
@@ -161,7 +184,13 @@ export async function patchFloorLoaders(): Promise<void> {
   ): void {
     if (opcode === 0) return;
     if (opcode === 1) {
-      def.color = dv.readInt24();
+      const rgb = readUint24(dv);
+      def.color = rgb;
+      // Library's `load()` will overwrite `def.color` with a 16-bit HSL pack
+      // via `convertToHsl`, which loses the raw RGB. Save the raw value now
+      // so terrain.ts can detect the magenta (0xFF00FF) invisible-overlay
+      // sentinel the OSRS client uses.
+      def.rawPrimaryRgb = rgb;
     } else if (opcode === 2) {
       // legacy 1-byte texture id (caches before textures > 255 existed)
       def.texture = dv.readUint8();
@@ -174,7 +203,7 @@ export async function patchFloorLoaders(): Promise<void> {
     } else if (opcode === 6) {
       def.name = dv.readString();
     } else if (opcode === 7) {
-      def.secondaryColor = dv.readInt24();
+      def.secondaryColor = readUint24(dv);
     } else if (opcode === 8) {
       // nothing (flag-only opcode in current client)
     } else if (opcode === 9) {
@@ -186,7 +215,7 @@ export async function patchFloorLoaders(): Promise<void> {
     } else if (opcode === 12) {
       // blendTexture = true (no value)
     } else if (opcode === 13) {
-      dv.readInt24(); // underwaterColor
+      readUint24(dv); // underwaterColor (advance stream without storing)
     } else if (opcode === 14) {
       dv.readUint8(); // waterOpacity
     } else if (opcode === 15) {

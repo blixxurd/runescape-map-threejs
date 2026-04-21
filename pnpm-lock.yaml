@@ -48,6 +48,9 @@ importers:
         specifier: ^0.169.0
         version: 0.169.0
     devDependencies:
+      '@rsmap/extractor':
+        specifier: workspace:*
+        version: link:../extractor
       '@types/three':
         specifier: ^0.169.0
         version: 0.169.0

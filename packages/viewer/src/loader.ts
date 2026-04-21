@@ -8,6 +8,10 @@ import type { TerrainMeta, LocsManifest, TextureAtlas } from "@rsmap/shared";
  *
  * Everything is served as static assets by Vite (no processing in the
  * viewer — the extractor already baked them into Three-ready shapes).
+ *
+ * When a bundle is missing, we fall back to the dev server's auto-extract
+ * middleware (see `vite.config.ts`) and retry. In `vite build` output the
+ * middleware is absent, so a 404 stays a 404.
  */
 
 export interface RegionData {
@@ -30,19 +34,53 @@ export interface RegionData {
   locsFramesPositions: Float32Array;
 }
 
+export type LoadPhase =
+  | { phase: "fetching" }
+  | { phase: "extracting" }
+  | { phase: "ready" };
+
+export interface LoadRegionOptions {
+  /** Called when the loader changes state (fetching → extracting → fetching). */
+  onPhaseChange?: (phase: LoadPhase) => void;
+  /** If false, skip the auto-extract fallback on 404 — behaves like a pure
+   *  static fetch. Used by `vite build` output and tests. */
+  autoExtract?: boolean;
+}
+
+class MissingBundleError extends Error {}
+
 async function fetchBinary(url: string): Promise<ArrayBuffer> {
   const r = await fetch(url);
+  if (r.status === 404) throw new MissingBundleError(`GET ${url} → 404`);
   if (!r.ok) throw new Error(`GET ${url} → ${r.status}`);
   return r.arrayBuffer();
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
   const r = await fetch(url);
+  if (r.status === 404) throw new MissingBundleError(`GET ${url} → 404`);
   if (!r.ok) throw new Error(`GET ${url} → ${r.status}`);
   return (await r.json()) as T;
 }
 
-export async function loadRegion(regionId: number): Promise<RegionData> {
+/**
+ * Asks the dev server to extract this region. Resolves when the bundle is
+ * on disk; throws when the region has no map data (404) or the extractor
+ * fails (500). The middleware serializes requests, so many concurrent
+ * callers for the same region will share one extraction.
+ */
+async function requestExtraction(regionId: number): Promise<void> {
+  const r = await fetch(`/api/extract/${regionId}`, { method: "POST" });
+  if (r.ok) return;
+  const body = (await r.json().catch(() => ({}))) as { error?: string };
+  throw new Error(
+    r.status === 404
+      ? `region ${regionId} has no map data`
+      : `extract ${regionId} failed (${r.status}): ${body.error ?? "unknown"}`,
+  );
+}
+
+async function fetchBundle(regionId: number): Promise<RegionData> {
   const base = `/regions/${regionId}`;
   const [terrainMeta, locs, atlas] = await Promise.all([
     fetchJson<TerrainMeta>(`${base}/terrain.meta.json`),
@@ -92,4 +130,25 @@ export async function loadRegion(regionId: number): Promise<RegionData> {
     locsUvs: new Float32Array(locsUvBuf),
     locsFramesPositions: new Float32Array(locsFramesBuf),
   };
+}
+
+export async function loadRegion(
+  regionId: number,
+  opts: LoadRegionOptions = {},
+): Promise<RegionData> {
+  const { onPhaseChange, autoExtract = true } = opts;
+  onPhaseChange?.({ phase: "fetching" });
+  try {
+    const data = await fetchBundle(regionId);
+    onPhaseChange?.({ phase: "ready" });
+    return data;
+  } catch (err) {
+    if (!autoExtract || !(err instanceof MissingBundleError)) throw err;
+    onPhaseChange?.({ phase: "extracting" });
+    await requestExtraction(regionId);
+    onPhaseChange?.({ phase: "fetching" });
+    const data = await fetchBundle(regionId);
+    onPhaseChange?.({ phase: "ready" });
+    return data;
+  }
 }

@@ -87,11 +87,17 @@ declare module "osrscachereader" {
 
   export interface OverlayDefinition {
     id: number;
-    color: number; // packed HSL (16-bit)
+    color: number; // packed HSL (16-bit) after the library's convertToHsl
     texture: number;
     hideUnderlay: boolean;
     secondaryColor: number;
     secondaryTextureId?: number;
+    /** Raw 0xRRGGBB from opcode 1, captured by the patched handleOpcode
+     *  BEFORE the library overwrites `color` with packed HSL. Needed to
+     *  detect the OSRS magenta sentinel (0xFF00FF = invisible overlay). */
+    rawPrimaryRgb?: number;
+    /** Opcode 6 name (only set when present in the cache entry). */
+    name?: string;
   }
 
   export interface ObjectDefinition {

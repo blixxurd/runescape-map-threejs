@@ -1,10 +1,10 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TILE_SIZE, TILES_PER_SIDE } from "@rsmap/shared";
-import { loadRegion, type RegionData } from "./loader.js";
+import { loadRegion, type LoadPhase, type RegionData } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs, tickLocAnimations, type LocAnimationState } from "./locs/placeLocs.js";
-import { DebugInspector, type RegionInfo } from "./debug/inspector.js";
+import { DebugInspector } from "./debug/inspector.js";
 import { createNightSky } from "./sky/nightSky.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
@@ -55,8 +55,9 @@ async function setupRegion(
   centerRegionX: number,
   centerRegionZ: number,
   renderer: THREE.WebGLRenderer,
+  onPhaseChange?: (phase: LoadPhase) => void,
 ): Promise<LoadedRegion> {
-  const region = await loadRegion(regionId);
+  const region = await loadRegion(regionId, { onPhaseChange });
 
   const regionX = (regionId >> 8) & 0xff;
   const regionZ = regionId & 0xff;
@@ -173,45 +174,56 @@ async function main(): Promise<void> {
   sun.position.set(1, 1.4, 0.6);
   scene.add(sun);
 
-  // Compute the 3×3 (or (2r+1)²) region ids centered on the URL region and
-  // load each. A region that 404s (ocean, missing bundle) is skipped with
-  // a console warning rather than failing the whole load.
   const centerRegionX = (CENTER_REGION_ID >> 8) & 0xff;
   const centerRegionZ = CENTER_REGION_ID & 0xff;
-  const candidateIds: number[] = [];
-  for (let dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
-    for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
-      const rx = centerRegionX + dx;
-      const rz = centerRegionZ + dz;
-      if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) continue;
-      candidateIds.push((rx << 8) | rz);
-    }
-  }
 
-  const results = await Promise.allSettled(
-    candidateIds.map((id) => setupRegion(id, centerRegionX, centerRegionZ, renderer)),
-  );
-  const loaded: LoadedRegion[] = [];
-  const missing: number[] = [];
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i]!;
-    if (r.status === "fulfilled") {
-      loaded.push(r.value);
-    } else {
-      missing.push(candidateIds[i]!);
-      console.warn(`[main] region ${candidateIds[i]} skipped:`, r.reason);
-    }
-  }
-  if (loaded.length === 0) {
-    throw new Error(
-      `no regions loaded — center ${CENTER_REGION_ID} missing from /regions/; run \`pnpm extract\` first`,
-    );
-  }
+  // Region streaming state. `regions` holds everything finished and in the
+  // scene; `loading` dedupes concurrent requests; `failed` absorbs ocean /
+  // off-map ids so we don't hammer the middleware on every stream tick.
+  const regions = new Map<number, LoadedRegion>();
+  const loading = new Map<number, Promise<LoadedRegion | null>>();
+  const failed = new Set<number>();
+  const regionPhase = new Map<number, LoadPhase["phase"]>();
 
-  for (const lr of loaded) {
-    scene.add(lr.terrainGroup);
-    scene.add(lr.locsGroup);
-  }
+  /** World camera → cache regionId under the camera's current horizontal
+   *  position. Inverse of the `offsetX/offsetZ` math in `setupRegion`. */
+  const cameraRegionId = (): number => {
+    const dRx = Math.floor(camera.position.x / REGION_SPAN);
+    const dRz = Math.floor(-camera.position.z / REGION_SPAN);
+    const rx = Math.max(0, Math.min(0xff, centerRegionX + dRx));
+    const rz = Math.max(0, Math.min(0xff, centerRegionZ + dRz));
+    return (rx << 8) | rz;
+  };
+
+  /** Ids we want loaded right now: (2r+1)² square around the camera's
+   *  current region, clamped to the 256×256 cache grid. */
+  const desiredRegionIds = (): number[] => {
+    const centerId = cameraRegionId();
+    const crx = (centerId >> 8) & 0xff;
+    const crz = centerId & 0xff;
+    const ids: number[] = [];
+    for (let dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
+      for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
+        const rx = crx + dx;
+        const rz = crz + dz;
+        if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) continue;
+        ids.push((rx << 8) | rz);
+      }
+    }
+    return ids;
+  };
+
+  /**
+   * Forward decl — filled in after `updateHud` / `applyPlaneCap` /
+   * `inspector` exist. Called from the tick's stream check and from the
+   * initial loader. Already-loaded / already-in-flight ids resolve
+   * immediately without kicking off work; failed ids resolve to null.
+   */
+  let startLoad!: (regionId: number) => Promise<LoadedRegion | null>;
+
+  // Initial grid ids — kicked off concurrently below once the loader is
+  // fully wired. First paint waits for at least the center region.
+  const initialIds = desiredRegionIds();
 
   // Night sky sits on the camera's position so its dome follows the view.
   // It doesn't care about region count.
@@ -222,34 +234,39 @@ async function main(): Promise<void> {
   // upper stories + roofs hidden. Applied uniformly across every loaded
   // region. `[` goes down a floor, `]` goes up. Cumulative: cap=3 shows all.
   let planeCap = 1;
-  const applyPlaneCap = (): void => {
-    for (const lr of loaded) {
-      for (const child of lr.terrainGroup.children) {
-        const p = (child.userData as { plane?: number }).plane;
-        if (p !== undefined) child.visible = p <= planeCap;
-      }
-      for (const child of lr.locsGroup.children) {
-        const p = (child.userData as { plane?: number }).plane;
-        if (p !== undefined) child.visible = p <= planeCap;
-      }
+  const applyPlaneCapTo = (lr: LoadedRegion): void => {
+    for (const child of lr.terrainGroup.children) {
+      const p = (child.userData as { plane?: number }).plane;
+      if (p !== undefined) child.visible = p <= planeCap;
     }
+    for (const child of lr.locsGroup.children) {
+      const p = (child.userData as { plane?: number }).plane;
+      if (p !== undefined) child.visible = p <= planeCap;
+    }
+  };
+  const applyPlaneCap = (): void => {
+    for (const lr of regions.values()) applyPlaneCapTo(lr);
     updateHud();
   };
 
-  const centerRegion = loaded.find((r) => r.regionId === CENTER_REGION_ID) ?? loaded[0]!;
-  const totalPlacements = loaded.reduce((n, lr) => n + lr.region.locs.placements.length, 0);
-  const totalVerts = loaded.reduce((n, lr) => n + lr.region.terrainMeta.totalVertexCount, 0);
-  const hudBase =
-    `center ${centerRegion.regionId}  build ${centerRegion.region.terrainMeta.buildId}\n` +
-    `${loaded.length}/${candidateIds.length} regions loaded` +
-    (missing.length > 0 ? ` (missing: ${missing.join(", ")})` : "") +
-    `\nterrain: ${totalVerts} verts   locs: ${totalPlacements} placements`;
   const updateHud = (): void => {
+    const extracting = [...regionPhase.entries()].filter(([, p]) => p === "extracting").map(([id]) => id);
+    const fetching = [...regionPhase.entries()].filter(([, p]) => p === "fetching").map(([id]) => id);
+    const inflight: string[] = [];
+    if (extracting.length > 0) inflight.push(`extracting ${extracting.slice(0, 3).join(", ")}`);
+    else if (fetching.length > 0) inflight.push(`fetching ${fetching.slice(0, 3).join(", ")}`);
+    const camId = cameraRegionId();
     setHud(
-      `${hudBase}\nvisible: plane 0..${planeCap}   [ / ] to change   B: aurora sky ${nightSky.mesh.visible ? "on" : "off"}\n` +
+      `center ${CENTER_REGION_ID}  build ${BUILD_ID ?? "?"}  under camera: ${camId}\n` +
+        `${regions.size} regions loaded${inflight.length > 0 ? " · " + inflight.join(" · ") : ""}` +
+        (failed.size > 0 ? `  (skipped ${failed.size})` : "") +
+        `\nvisible: plane 0..${planeCap}   [ / ] to change   B: aurora sky ${nightSky.mesh.visible ? "on" : "off"}\n` +
         `WASD pan · Space/Ctrl up·down · Shift sprint · drag rotate · scroll zoom`,
     );
   };
+  // Build id is surfaced once we've loaded the first region (all regions
+  // share the pinned extractor build). Until then the HUD shows `?`.
+  let BUILD_ID: number | undefined;
   window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
     if (e.key === "[" && planeCap > 0) {
@@ -263,7 +280,6 @@ async function main(): Promise<void> {
       updateHud();
     }
   });
-  applyPlaneCap();
 
   // WASD pan — unchanged from the single-region build. Speed scales with
   // camera height so the Google-Maps feel carries into the larger grid.
@@ -278,17 +294,74 @@ async function main(): Promise<void> {
     keysHeld.clear();
   });
 
-  // Debug inspector — one map entry per loaded region so a hit on any
-  // region's terrain/loc mesh resolves against the right cache data.
-  const regionInfos: RegionInfo[] = loaded.map((lr) => ({
-    regionId: lr.regionId,
-    terrainMeta: lr.region.terrainMeta,
-    locsManifest: lr.region.locs,
-    atlas: lr.region.atlas,
-    terrainGroup: lr.terrainGroup,
-    locsGroup: lr.locsGroup,
-  }));
-  new DebugInspector({ camera, renderer }, regionInfos);
+  // Debug inspector — starts empty; each stream-loaded region registers
+  // itself via `addRegion` when its meshes are added to the scene.
+  const inspector = new DebugInspector({ camera, renderer }, []);
+
+  // Finalize the streaming loader now that scene + inspector + planeCap
+  // machinery all exist. `startLoad` was forward-declared above so the
+  // initial `Promise.allSettled` can call it.
+  startLoad = async (regionId: number): Promise<LoadedRegion | null> => {
+    const existing = regions.get(regionId);
+    if (existing) return existing;
+    const inflight = loading.get(regionId);
+    if (inflight) return inflight;
+    if (failed.has(regionId)) return null;
+
+    regionPhase.set(regionId, "fetching");
+    updateHud();
+    const p = setupRegion(regionId, centerRegionX, centerRegionZ, renderer, (phase) => {
+      regionPhase.set(regionId, phase.phase);
+      updateHud();
+    })
+      .then((lr) => {
+        regions.set(regionId, lr);
+        scene.add(lr.terrainGroup);
+        scene.add(lr.locsGroup);
+        applyPlaneCapTo(lr);
+        inspector.addRegion({
+          regionId: lr.regionId,
+          terrainMeta: lr.region.terrainMeta,
+          locsManifest: lr.region.locs,
+          atlas: lr.region.atlas,
+          terrainGroup: lr.terrainGroup,
+          locsGroup: lr.locsGroup,
+        });
+        if (BUILD_ID === undefined) BUILD_ID = lr.region.terrainMeta.buildId;
+        return lr;
+      })
+      .catch((err: unknown) => {
+        // 404s come back as "region X has no map data" (ocean / off-map) —
+        // expected and cheap to record. Other errors (500, extractor crash)
+        // also land here; the dev-server terminal has the underlying trace.
+        console.warn(`[stream] region ${regionId} skipped:`, err);
+        failed.add(regionId);
+        return null;
+      })
+      .finally(() => {
+        loading.delete(regionId);
+        regionPhase.delete(regionId);
+        updateHud();
+      });
+    loading.set(regionId, p);
+    return p;
+  };
+
+  // Initial kickoff — block until the center region (+ neighbors in the
+  // best case) has shown up so the first paint isn't empty.
+  const initialResults = await Promise.allSettled(initialIds.map((id) => startLoad(id)));
+  const centerLoaded = regions.has(CENTER_REGION_ID);
+  if (!centerLoaded) {
+    const centerReason = initialResults.find(
+      (_, i) => initialIds[i] === CENTER_REGION_ID,
+    );
+    throw new Error(
+      `center region ${CENTER_REGION_ID} unavailable (${
+        centerReason?.status === "rejected" ? String(centerReason.reason) : "see console"
+      }). In dev, the viewer auto-extracts; check the terminal for extractor errors. For a production build, run \`pnpm extract --region ${CENTER_REGION_ID}\` first.`,
+    );
+  }
+  applyPlaneCap();
 
   const startTime = performance.now();
   let lastTickMs = startTime;
@@ -296,6 +369,21 @@ async function main(): Promise<void> {
   const tmpRight = new THREE.Vector3();
   const tmpMove = new THREE.Vector3();
   const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+  // Region streaming — check which regions should be loaded around the
+  // camera. Cheap work; we throttle it anyway so we don't spam the
+  // middleware on every frame. Only fires when the camera's under-region
+  // actually changes (or at most ~3 Hz as a safety net).
+  let lastStreamRegionId = cameraRegionId();
+  let lastStreamCheckMs = startTime;
+  const streamCheck = (nowMs: number): void => {
+    const camId = cameraRegionId();
+    if (camId === lastStreamRegionId && nowMs - lastStreamCheckMs < 333) return;
+    lastStreamRegionId = camId;
+    lastStreamCheckMs = nowMs;
+    for (const id of desiredRegionIds()) void startLoad(id);
+    updateHud();
+  };
 
   const tick = (): void => {
     const nowMs = performance.now();
@@ -328,10 +416,11 @@ async function main(): Promise<void> {
     }
 
     controls.update();
+    streamCheck(nowMs);
     // Animate every region's locs. Each region owns its geometry buffers,
     // so the ticks don't interfere across regions — same elapsed time drives
     // them all, matching the OSRS client's global animation clock.
-    for (const lr of loaded) {
+    for (const lr of regions.values()) {
       if (lr.animated.length > 0) tickLocAnimations(lr.animated, nowMs - startTime);
     }
     nightSky.update(camera.position, nowMs - startTime);
