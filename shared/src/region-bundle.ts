@@ -16,6 +16,15 @@ export const VERTICES_PER_SIDE = TILES_PER_SIDE + 1;
 export const PLANES = 4;
 export const TILE_SIZE = 128;
 
+/** Jagex region-id layout: the high byte is regionX, the low byte is regionZ. */
+export const packRegionId = (regionX: number, regionZ: number): number =>
+  ((regionX & 0xff) << 8) | (regionZ & 0xff);
+
+export const unpackRegionId = (regionId: number): { regionX: number; regionZ: number } => ({
+  regionX: (regionId >> 8) & 0xff,
+  regionZ: regionId & 0xff,
+});
+
 export interface RegionBundle {
   terrainMeta: TerrainMeta;
   locs: LocsManifest;

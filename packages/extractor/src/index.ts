@@ -19,6 +19,7 @@ import {
 import { buildAtlas, writeAtlas } from "./texture/atlas.js";
 import { patchObjectLoader, getObjectLoaderFailureCount } from "./patches/objectLoader.js";
 import { patchFloorLoaders } from "./patches/floorLoaders.js";
+import { unpackRegionId } from "@rsmap/shared";
 
 /**
  * CLI: `pnpm extract -- --region <id>`
@@ -112,8 +113,7 @@ export async function extractRegion(
   regionId: number,
   session: ExtractorSession,
 ): Promise<{ outDir: string }> {
-  const regionX = (regionId >> 8) & 0xff;
-  const regionZ = regionId & 0xff;
+  const { regionX, regionZ } = unpackRegionId(regionId);
   console.log(`[extract] region ${regionId} = (${regionX}, ${regionZ})`);
 
   const outDir = join(VIEWER_REGIONS, String(regionId));

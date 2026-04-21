@@ -24,7 +24,7 @@ import type {
   DebugUnderlayDef,
   DebugOverlayDef,
 } from "@rsmap/shared";
-import { TILES_PER_SIDE, VERTICES_PER_SIDE, PLANES, TILE_SIZE } from "@rsmap/shared";
+import { TILES_PER_SIDE, VERTICES_PER_SIDE, PLANES, TILE_SIZE, packRegionId } from "@rsmap/shared";
 
 interface ResolvedPalette {
   underlays: Map<number, UnderlayDefinition>;
@@ -619,7 +619,7 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
 
   const meta: TerrainMeta = {
     schemaVersion: 2,
-    regionId: (regionX << 8) | regionZ,
+    regionId: packRegionId(regionX, regionZ),
     regionX,
     regionZ,
     planes: PLANES,

@@ -181,6 +181,15 @@ export function emitTileTriangles(
 
   for (let i = 0; i < n; i++) {
     let vi = vertexIndices[i]!;
+    // Rotate the shape table's vertex ids by `rotation` quarter-turns.
+    // Jagex interleaves corner + mid-edge ids on the outer ring
+    // (1=SW, 2=S, 3=SE, 4=E, 5=NE, 6=N, 7=NW, 8=W), so a 90° rotation
+    // advances outer verts by 2 slots on the 8-ring — hence the
+    // `- rotation - rotation` for evens (mid-edges). Corners (odd, <=8)
+    // pass through because the shape tables only reference them by their
+    // rotated face mapping, not by id remapping. Verts 9..12 are inner
+    // corner-quadrant points, 13..16 are overlay midpoints — each a
+    // standalone 4-ring that rotates by 1 slot per quarter-turn.
     if ((vi & 1) === 0 && vi <= 8) {
       vi = ((vi - rotation - rotation - 1) & 7) + 1;
     } else if (vi > 8 && vi <= 12) {

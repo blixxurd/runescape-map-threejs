@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { TILE_SIZE, TILES_PER_SIDE } from "@rsmap/shared";
+import { TILE_SIZE, TILES_PER_SIDE, packRegionId, unpackRegionId } from "@rsmap/shared";
 import { loadRegion, type LoadPhase, type RegionData } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs, tickLocAnimations, type LocAnimationState } from "./locs/placeLocs.js";
@@ -59,8 +59,7 @@ async function setupRegion(
 ): Promise<LoadedRegion> {
   const region = await loadRegion(regionId, { onPhaseChange });
 
-  const regionX = (regionId >> 8) & 0xff;
-  const regionZ = regionId & 0xff;
+  const { regionX, regionZ } = unpackRegionId(regionId);
   const dRegionX = regionX - centerRegionX;
   const dRegionZ = regionZ - centerRegionZ;
   // Cache +Y (north) maps to world −Z (because world +Z = south). A region
@@ -174,8 +173,7 @@ async function main(): Promise<void> {
   sun.position.set(1, 1.4, 0.6);
   scene.add(sun);
 
-  const centerRegionX = (CENTER_REGION_ID >> 8) & 0xff;
-  const centerRegionZ = CENTER_REGION_ID & 0xff;
+  const { regionX: centerRegionX, regionZ: centerRegionZ } = unpackRegionId(CENTER_REGION_ID);
 
   // Region streaming state. `regions` holds everything finished and in the
   // scene; `loading` dedupes concurrent requests; `failed` absorbs ocean /
@@ -192,22 +190,21 @@ async function main(): Promise<void> {
     const dRz = Math.floor(-camera.position.z / REGION_SPAN);
     const rx = Math.max(0, Math.min(0xff, centerRegionX + dRx));
     const rz = Math.max(0, Math.min(0xff, centerRegionZ + dRz));
-    return (rx << 8) | rz;
+    return packRegionId(rx, rz);
   };
 
   /** Ids we want loaded right now: (2r+1)² square around the camera's
    *  current region, clamped to the 256×256 cache grid. */
   const desiredRegionIds = (): number[] => {
     const centerId = cameraRegionId();
-    const crx = (centerId >> 8) & 0xff;
-    const crz = centerId & 0xff;
+    const { regionX: crx, regionZ: crz } = unpackRegionId(centerId);
     const ids: number[] = [];
     for (let dz = -NEIGHBOR_RADIUS; dz <= NEIGHBOR_RADIUS; dz++) {
       for (let dx = -NEIGHBOR_RADIUS; dx <= NEIGHBOR_RADIUS; dx++) {
         const rx = crx + dx;
         const rz = crz + dz;
         if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) continue;
-        ids.push((rx << 8) | rz);
+        ids.push(packRegionId(rx, rz));
       }
     }
     return ids;
