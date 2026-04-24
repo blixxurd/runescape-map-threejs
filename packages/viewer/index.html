@@ -39,6 +39,13 @@
         transition: opacity 0.15s ease-out;
       }
       #copyToast.show { opacity: 1; }
+      /* H hides every UI overlay for clean screenshots. Canvas keeps receiving
+         input so camera + tool hotkeys still work while hidden. */
+      body.ui-hidden #hud,
+      body.ui-hidden #inspector,
+      body.ui-hidden #inspectHint,
+      body.ui-hidden #copyToast,
+      body.ui-hidden #toolPanel { display: none !important; }
     </style>
   </head>
   <body>

@@ -9,6 +9,8 @@ public cache snapshots.
 
 ## What works
 
+**Rendering**
+
 - 64×64 map regions rendered as a single BufferGeometry per plane, with
   baked OSRS-accurate per-vertex lighting.
 - Underlay + overlay tile blending, overlay shape table, and shared
@@ -22,8 +24,28 @@ public cache snapshots.
   terrain blending and contoured-loc heights.
 - On-demand region extraction: visit `?region=<id>` and the dev server
   extracts the bundle in-process if it hasn't been generated yet.
-- Debug inspector: hold **Shift** while hovering for the cache data
-  behind any tile or loc; **Shift+click** copies a paste-ready block.
+
+**Editor tools** (top-right panel)
+
+- **NPCs** — search ~12k NPCs, click to arm, click terrain to place.
+  Animations auto-loop; pick from the NPC's declared animations or
+  search the full 12k-sequence catalog ("more animations ▾").
+- **Objects** — search ~28k baked locs (walls, scenery, doors, crates).
+  R rotates in 45° steps (supports diagonal fences). Contoured objects
+  follow terrain slopes; animated ones (mills, fires, banners) cycle
+  frames.
+- **Items** — search ~5k items; drops the inventory-model on the
+  ground at click position.
+- **Paint** — color picker + click to tint a tile.
+- **Eyedropper (I)** — click any baked loc to grab its id and re-arm
+  the Object tool for placing copies.
+- **Free placement** toggle — disable tile-center snap for precise
+  off-grid positioning.
+- **Shift+click a placement** — delete it (cursor flips to a red X
+  while Shift is held).
+- **Debug inspector** — when nothing is armed, hold **Shift** to see
+  cache data behind any tile or loc; **Shift+click** copies a
+  paste-ready block.
 
 ## What doesn't (yet)
 
@@ -34,6 +56,10 @@ public cache snapshots.
   sync).
 - Streaming / LOD for whole-world rendering. See
   [`docs/scaling.md`](docs/scaling.md) for the plan.
+- Editor state is session-only (not persisted across reloads).
+- Attack/emote animations for NPCs live in game scripts, not the cache
+  — the "more animations" search lets you try any sequence id but
+  mismatched skeletons will render oddly.
 
 A fuller list of intentional scope cuts lives in
 [`CLAUDE.md`](CLAUDE.md) under "Known M1 limitations".

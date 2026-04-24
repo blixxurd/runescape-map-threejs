@@ -100,6 +100,67 @@ declare module "osrscachereader" {
     name?: string;
   }
 
+  export interface ItemDefinition {
+    id: number;
+    name?: string;
+    inventoryModel?: number;
+    recolorToFind?: number[];
+    recolorToReplace?: number[];
+    retextureToFind?: number[];
+    retextureToReplace?: number[];
+    ambient?: number;
+    contrast?: number;
+    /** Scale multiplied by 128 (128 = 1×). Used for ground-item scaling. */
+    resizeX?: number;
+    resizeY?: number;
+    resizeZ?: number;
+    /** Rotations used for 2D inventory rendering — ignored for ground models. */
+    xan2d?: number;
+    yan2d?: number;
+    zan2d?: number;
+    /** Present for banknotes: item that owns the graphic template. */
+    notedID?: number;
+    notedTemplate?: number;
+    /** Present for placeholder items (empty bank slots etc). */
+    placeholderId?: number;
+    placeholderTemplateId?: number;
+    members?: boolean;
+    stackable?: number;
+    category?: number;
+  }
+
+  export interface NpcDefinition {
+    id: number;
+    name?: string;
+    models: number[];
+    size: number;
+    standingAnimation?: number;
+    walkingAnimation?: number;
+    runAnimation?: number;
+    rotateLeftAnimation?: number;
+    rotateRightAnimation?: number;
+    rotate180Animation?: number;
+    rotate90LeftAnimation?: number;
+    rotate90RightAnimation?: number;
+    runRotate180Animation?: number;
+    runRotateLeftAnimation?: number;
+    runRotateRightAnimation?: number;
+    crawlAnimation?: number;
+    crawlRotate180Animation?: number;
+    crawlRotateLeftAnimation?: number;
+    crawlRotateRightAnimation?: number;
+    combatLevel?: number;
+    ambient?: number;
+    contrast?: number;
+    recolorToFind?: number[];
+    recolorToReplace?: number[];
+    retextureToFind?: number[];
+    retextureToReplace?: number[];
+    heightScale?: number;
+    category?: number;
+    isMinimapVisible?: boolean;
+  }
+
   export interface ObjectDefinition {
     id: number;
     name?: string;
@@ -232,6 +293,7 @@ declare module "osrscachereader" {
     close(): void;
     getMap(x: number, y: number): Promise<MapDefinition>;
     getLoc(x: number, y: number): Promise<LocationDefinition>;
+    getNPC(id: number, options?: RSCacheOptions): Promise<NpcDefinition>;
     getDef<T = unknown>(
       indexId: number | RSCacheIndexType,
       archiveId: number | RSCacheConfigType,

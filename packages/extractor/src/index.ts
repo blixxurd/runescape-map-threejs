@@ -20,6 +20,16 @@ import { buildAtlas, writeAtlas } from "./texture/atlas.js";
 import { patchObjectLoader, getObjectLoaderFailureCount } from "./patches/objectLoader.js";
 import { patchFloorLoaders } from "./patches/floorLoaders.js";
 import { unpackRegionId } from "@rsmap/shared";
+export { bakeNpc, buildNpcCatalog } from "./entities/npcModel.js";
+export type { BakedNpc, NpcCatalogEntry } from "./entities/npcModel.js";
+export { bakeObject, buildObjectCatalog } from "./entities/objectModel.js";
+export type { BakedObject, ObjectCatalogEntry } from "./entities/objectModel.js";
+export { bakeItem, buildItemCatalog } from "./entities/itemModel.js";
+export type { BakedItem, ItemCatalogEntry } from "./entities/itemModel.js";
+export { buildSequenceCatalog } from "./entities/sequenceCatalog.js";
+export type { SequenceCatalogEntry } from "./entities/sequenceCatalog.js";
+export { buildGlobalAtlas } from "./texture/atlas.js";
+export type { BakedAtlas } from "./texture/atlas.js";
 
 /**
  * CLI: `pnpm extract -- --region <id>`

@@ -16,106 +16,14 @@ import type { LocsManifest, LocBlock, LocPlacement, LocsDebug, LocDebugBlock } f
 import { TILE_SIZE, TILES_PER_SIDE } from "@rsmap/shared";
 import { applyFramePose, rotateModelVertices } from "./animate.js";
 
-/**
- * Client-authentic per-face lighting, ported from `Model.applyLighting` +
- * `Model.method816` in runejs/refactored-client-435's `Model.java`.
- *
- * The client bakes per-vertex lighting at model-load time and at render time
- * just multiplies texture × vertex color. We mirror that so the viewer can
- * use `MeshBasicMaterial` (no scene lights, no double-darken).
- *
- * Formula:
- *   magnitude    = |lightDir|
- *   contrastScale = contrast × magnitude / 256
- *   per-face:
- *     normal     = cross(edge1, edge2), scaled to |n| ≈ 256
- *     lightness  = ambient + dot(lightDir, normal) / (contrastScale × 1.5)
- *                  // SIGNED — back-facing faces get very low lightness
- *   per-vertex-color:
- *     newLum     = clamp(lightness × (faceHsl & 0x7f) / 128, 2, 126)
- *     litHsl     = (faceHsl & 0xff80) | newLum
- *     rgb        = hsl16ToRgb(litHsl)
- *
- * Critical: `method816` scales the HSL's luminance bits, preserving hue +
- * saturation unchanged. A naive RGB multiply (c × factor) would wash out
- * saturated colors (tree trunks, dyed cloth, etc).
- *
- * Normals are computed in CLIENT-space (pre-Y/Z-flip) so client constants
- * apply unchanged.
- */
-const BASE_AMBIENT = 64;
-const BASE_CONTRAST = 768;
-const LIGHT_DIR_X = -50;
-const LIGHT_DIR_Y = -10;
-const LIGHT_DIR_Z = -50;
-const LIGHT_MAG = Math.sqrt(
-  LIGHT_DIR_X * LIGHT_DIR_X + LIGHT_DIR_Y * LIGHT_DIR_Y + LIGHT_DIR_Z * LIGHT_DIR_Z,
-) | 0;
-
-/** Per-face lightness integer. `ambient` and `contrast` can be overridden
- *  per-loc by `ObjectDefinition.ambient` / `ObjectDefinition.contrast`
- *  (opcodes 29 and 39). Port of `Model.applyLighting` — the `arg0`/`arg1`
- *  in the reference are exactly the ambient/contrast the caller supplies.
- */
-function faceLightness(
-  nxRaw: number,
-  nyRaw: number,
-  nzRaw: number,
-  ambient: number,
-  contrast: number,
-): number {
-  const len = Math.sqrt(nxRaw * nxRaw + nyRaw * nyRaw + nzRaw * nzRaw);
-  if (len === 0) return ambient;
-  const nx = ((nxRaw * 256) / len) | 0;
-  const ny = ((nyRaw * 256) / len) | 0;
-  const nz = ((nzRaw * 256) / len) | 0;
-  const dot = LIGHT_DIR_X * nx + LIGHT_DIR_Y * ny + LIGHT_DIR_Z * nz;
-  const contrastScale = (contrast * LIGHT_MAG) >> 8;
-  const divisor = contrastScale + (contrastScale >> 1);
-  return ambient + ((dot / divisor) | 0);
-}
-
-/** Client-authentic HSL luminance adjustment — port of `method816`. */
-function applyLightToHsl(hsl: number, lightness: number): number {
-  let newLum = (lightness * (hsl & 0x7f)) >> 7;
-  if (newLum < 2) newLum = 2;
-  else if (newLum > 126) newLum = 126;
-  return (hsl & 0xff80) | newLum;
-}
-
-/**
- * OSRS applies per-loc face recolors/retextures via the `recolorToFind →
- * recolorToReplace` arrays on the object def. The library's `getModel` tries
- * but reads the wrong field names (`recolorFrom`/`retextureFrom`) and
- * silently no-ops. We do it ourselves after `getModel` returns.
- */
-function applyRecolor(model: ModelDefinition, def: ObjectDefinition): void {
-  const from = def.recolorToFind;
-  const to = def.recolorToReplace;
-  if (!from || !to || from.length === 0) return;
-  const faceColors = model.faceColors;
-  if (!faceColors) return;
-  const map = new Map<number, number>();
-  for (let i = 0; i < from.length; i++) map.set(from[i]!, to[i]!);
-  for (let i = 0; i < faceColors.length; i++) {
-    const dst = map.get(faceColors[i] as number);
-    if (dst !== undefined) (faceColors as number[])[i] = dst;
-  }
-}
-
-function applyRetexture(model: ModelDefinition, def: ObjectDefinition): void {
-  const from = def.retextureToFind;
-  const to = def.textureToReplace;
-  if (!from || !to || from.length === 0) return;
-  const faceTextures = model.faceTextures;
-  if (!faceTextures) return;
-  const map = new Map<number, number>();
-  for (let i = 0; i < from.length; i++) map.set(from[i]!, to[i]!);
-  for (let i = 0; i < faceTextures.length; i++) {
-    const dst = map.get(faceTextures[i] as number);
-    if (dst !== undefined) (faceTextures as number[])[i] = dst;
-  }
-}
+import {
+  BASE_AMBIENT,
+  BASE_CONTRAST,
+  faceLightness,
+  applyLightToHsl,
+  applyFaceColorSubstitution,
+  applyFaceTextureSubstitution,
+} from "../color/modelLight.js";
 
 /**
  * Loc-type → (modelType, rotationOffset) expansion. See memory notes for why
@@ -464,8 +372,8 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
       skipReasons.emptyModel++;
       continue;
     }
-    applyRecolor(model, objDef);
-    applyRetexture(model, objDef);
+    applyFaceColorSubstitution(model, objDef.recolorToFind, objDef.recolorToReplace);
+    applyFaceTextureSubstitution(model, objDef.retextureToFind, objDef.textureToReplace);
 
     // Def-level census — count unique defs (not blocks or placements) with
     // each feature set. Tells us whether to invest in supporting the field

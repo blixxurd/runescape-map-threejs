@@ -1,11 +1,23 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { TILE_SIZE, TILES_PER_SIDE, packRegionId, unpackRegionId } from "@rsmap/shared";
+import {
+  TILE_SIZE,
+  TILES_PER_SIDE,
+  VERTICES_PER_SIDE,
+  packRegionId,
+  unpackRegionId,
+} from "@rsmap/shared";
 import { loadRegion, type LoadPhase, type RegionData } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs, tickLocAnimations, type LocAnimationState } from "./locs/placeLocs.js";
 import { DebugInspector } from "./debug/inspector.js";
-import { createNightSky } from "./sky/nightSky.js";
+import { createSkybox, type SkyPreset } from "./sky/skybox.js";
+import { EnvironmentPanel } from "./sky/environmentPanel.js";
+import { ToolPanel } from "./tools/toolPanel.js";
+import { ModelPlacer } from "./tools/modelPlacer.js";
+import { TilePainter } from "./tools/tilePainter.js";
+import { Eyedropper } from "./tools/eyedropper.js";
+import { loadGlobalAtlas } from "./tools/globalAtlas.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
 // gamma/linear-space conversions. With Three's default color management on,
@@ -137,12 +149,10 @@ async function main(): Promise<void> {
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0b0f1a);
-  // Fog covers the extent of the loaded grid (REGION_SPAN × (2*radius+1)).
-  // The far end matches the diagonal across the grid so the far edge of a
-  // corner region doesn't pop in. Near is kept close to the center so
-  // neighbors fade gradually rather than all appearing at once.
+  // Fog is driven by the EnvironmentPanel and defaults off. Camera far
+  // plane is still sized to the loaded grid so distant regions render
+  // even without fog; fog's only job is the atmospheric fade.
   const gridDiag = REGION_SPAN * (2 * NEIGHBOR_RADIUS + 1) * Math.SQRT2;
-  scene.fog = new THREE.Fog(0x0b0f1a, REGION_SPAN * 0.5, gridDiag);
 
   const camera = new THREE.PerspectiveCamera(
     60,
@@ -222,10 +232,45 @@ async function main(): Promise<void> {
   // fully wired. First paint waits for at least the center region.
   const initialIds = desiredRegionIds();
 
-  // Night sky sits on the camera's position so its dome follows the view.
-  // It doesn't care about region count.
-  const nightSky = createNightSky();
-  scene.add(nightSky.mesh);
+  // Skybox rides the camera. The panel in `EnvironmentPanel` drives it via
+  // a dropdown — replaces the old `B` on/off hotkey. Fog is opt-in and
+  // configured from the same panel.
+  const INITIAL_SKY: SkyPreset = "aurora";
+  const skybox = createSkybox(INITIAL_SKY);
+  scene.add(skybox.mesh);
+  // Sync the scene clear color to the sky's horizon so fog (when enabled)
+  // blends into a matching tint rather than a hardcoded midnight blue.
+  scene.background = skybox.getBackgroundColor();
+  new EnvironmentPanel(
+    {
+      onSkyChange: (preset) => {
+        skybox.setPreset(preset);
+        scene.background = skybox.getBackgroundColor();
+        // If fog is currently on, keep its color in sync with the new sky.
+        if (scene.fog) (scene.fog as THREE.Fog).color.copy(skybox.getBackgroundColor());
+      },
+      onFogChange: ({ enabled, distance, thickness }) => {
+        if (!enabled) {
+          scene.fog = null;
+          return;
+        }
+        const near = distance * (1 - thickness);
+        const far = distance;
+        // Reuse existing fog object when possible to avoid re-keying the
+        // scene's fog reference every slider tick (Three.js re-uploads
+        // fog uniforms per material anyway, but a stable reference lets
+        // it skip the one-time "fog changed" path).
+        if (scene.fog instanceof THREE.Fog) {
+          scene.fog.near = near;
+          scene.fog.far = far;
+          scene.fog.color.copy(skybox.getBackgroundColor());
+        } else {
+          scene.fog = new THREE.Fog(skybox.getBackgroundColor(), near, far);
+        }
+      },
+    },
+    { sky: INITIAL_SKY },
+  );
 
   // Plane cap — OSRS roof-removal. Default 1: ground + bridges visible,
   // upper stories + roofs hidden. Applied uniformly across every loaded
@@ -257,7 +302,15 @@ async function main(): Promise<void> {
       `center ${CENTER_REGION_ID}  build ${BUILD_ID ?? "?"}  under camera: ${camId}\n` +
         `${regions.size} regions loaded${inflight.length > 0 ? " · " + inflight.join(" · ") : ""}` +
         (failed.size > 0 ? `  (skipped ${failed.size})` : "") +
-        `\nvisible: plane 0..${planeCap}   [ / ] to change   B: aurora sky ${nightSky.mesh.visible ? "on" : "off"}\n` +
+        (counts.npc + counts.object + counts.item + counts.paint > 0
+          ? `  · placed: ${[
+              counts.npc ? `${counts.npc} npc` : "",
+              counts.object ? `${counts.object} obj` : "",
+              counts.item ? `${counts.item} item` : "",
+              counts.paint ? `${counts.paint} tile` : "",
+            ].filter(Boolean).join(", ")}`
+          : "") +
+        `\nvisible: plane 0..${planeCap}   [ / ] to change   H: hide UI\n` +
         `WASD pan · Space/Ctrl up·down · Shift sprint · drag rotate · scroll zoom`,
     );
   };
@@ -266,15 +319,17 @@ async function main(): Promise<void> {
   let BUILD_ID: number | undefined;
   window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
+    // Skip when typing in the tool panel's search box etc.
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
     if (e.key === "[" && planeCap > 0) {
       planeCap--;
       applyPlaneCap();
     } else if (e.key === "]" && planeCap < MAX_PLANE) {
       planeCap++;
       applyPlaneCap();
-    } else if (e.key === "b" || e.key === "B") {
-      nightSky.mesh.visible = !nightSky.mesh.visible;
-      updateHud();
+    } else if (e.key === "h" || e.key === "H") {
+      document.body.classList.toggle("ui-hidden");
     }
   });
 
@@ -294,6 +349,250 @@ async function main(): Promise<void> {
   // Debug inspector — starts empty; each stream-loaded region registers
   // itself via `addRegion` when its meshes are added to the scene.
   const inspector = new DebugInspector({ camera, renderer }, []);
+
+  /**
+   * Bilinear terrain-height lookup at an arbitrary world (x, z). Walks the
+   * live `regions` map to find the owning region, reads directly out of
+   * its `terrainHeights` Int16 grid.
+   *
+   * Returns `null` when the XZ falls outside any loaded region or off the
+   * cache grid. Callers (the contoured placer) should treat a miss as
+   * "don't deform this vertex", matching the extractor's edge-clamp
+   * behaviour for contoured locs at region boundaries.
+   *
+   * Only plane 0 is queried — user placements live on the ground for now,
+   * and sampling the actual hit's plane isn't plumbed through yet.
+   */
+  const sampleTerrainAt = (worldX: number, worldZ: number): number | null => {
+    const dRx = Math.floor(worldX / REGION_SPAN);
+    const dRz = Math.floor(-worldZ / REGION_SPAN);
+    const rx = centerRegionX + dRx;
+    const rz = centerRegionZ + dRz;
+    if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) return null;
+    const regionId = packRegionId(rx, rz);
+    const lr = regions.get(regionId);
+    if (!lr) return null;
+    const localX = worldX - lr.offsetX;
+    const localZ = worldZ - lr.offsetZ;
+    const tileXf = localX / TILE_SIZE;
+    // World +Z = south, cache +Z = north → invert to get cache-space tile z.
+    const tileZf = -localZ / TILE_SIZE;
+    const tx = Math.max(0, Math.min(TILES_PER_SIDE - 1, Math.floor(tileXf)));
+    const tz = Math.max(0, Math.min(TILES_PER_SIDE - 1, Math.floor(tileZf)));
+    const fx = Math.max(0, Math.min(1, tileXf - Math.floor(tileXf)));
+    const fz = Math.max(0, Math.min(1, tileZf - Math.floor(tileZf)));
+    const heights = lr.region.terrainHeights;
+    const stride = VERTICES_PER_SIDE;
+    const base = 0; // plane 0 only, see docstring
+    const sw = heights[base + tz * stride + tx]!;
+    const se = heights[base + tz * stride + (tx + 1)]!;
+    const nw = heights[base + (tz + 1) * stride + tx]!;
+    const ne = heights[base + (tz + 1) * stride + (tx + 1)]!;
+    return (
+      sw * (1 - fx) * (1 - fz) +
+      se * fx * (1 - fz) +
+      nw * (1 - fx) * fz +
+      ne * fx * fz
+    );
+  };
+
+  // Editor tools — each one owns a free-standing group under the scene
+  // root and queries the live `regions` map via `getTerrainObjects` for
+  // raycasts. The tool panel orchestrates arming across all three so only
+  // one is active at a time.
+  const toolHost = {
+    scene,
+    camera,
+    canvas: renderer.domElement,
+    getTerrainObjects: () => [...regions.values()].map((r) => r.terrainGroup),
+    sampleTerrainAt,
+  };
+  // Shared global atlas for placer meshes. Kicks off in parallel with the
+  // rest of main's boot — the placers are constructed in-process once it
+  // resolves. The first atlas build on the server side is expensive (~1-3s
+  // decoding every texture) so we show an HUD hint while it loads.
+  setHud(`loading region ${CENTER_REGION_ID}… (+ texture atlas)`);
+  const globalAtlas = await loadGlobalAtlas();
+
+  const npcPlacer = new ModelPlacer(toolHost, {
+    endpoint: "/api/npc",
+    meshNamePrefix: "npc",
+    kind: "npc",
+    atlasTexture: globalAtlas.texture,
+  });
+  const objectPlacer = new ModelPlacer(toolHost, {
+    endpoint: "/api/object",
+    meshNamePrefix: "object",
+    kind: "object",
+    atlasTexture: globalAtlas.texture,
+  });
+  const itemPlacer = new ModelPlacer(toolHost, {
+    endpoint: "/api/item",
+    meshNamePrefix: "item",
+    kind: "item",
+    atlasTexture: globalAtlas.texture,
+  });
+  const tilePainter = new TilePainter(toolHost);
+  const eyedropper = new Eyedropper({
+    camera,
+    canvas: renderer.domElement,
+    // Expose the placer groups so "pick from world" also resolves the
+    // user's own placements, not just baked scenery.
+    getPlacerGroups: () => [
+      npcPlacer.getSceneGroup(),
+      objectPlacer.getSceneGroup(),
+      itemPlacer.getSceneGroup(),
+    ],
+  });
+
+  const counts = { npc: 0, object: 0, item: 0, paint: 0 };
+  npcPlacer.onPlacementsChanged = (n) => {
+    counts.npc = n;
+    updateHud();
+  };
+  objectPlacer.onPlacementsChanged = (n) => {
+    counts.object = n;
+    updateHud();
+  };
+  itemPlacer.onPlacementsChanged = (n) => {
+    counts.item = n;
+    updateHud();
+  };
+  tilePainter.onPlacementsChanged = (n) => {
+    counts.paint = n;
+    updateHud();
+  };
+
+  const modelPlacers = { npc: npcPlacer, object: objectPlacer, item: itemPlacer };
+
+  let toolPanel!: ToolPanel;
+  const forEachModelPlacer = (fn: (p: ModelPlacer) => void): void => {
+    fn(npcPlacer);
+    fn(objectPlacer);
+    fn(itemPlacer);
+  };
+  /** Cancel every tool except `keep` (if provided). Used every time we
+   *  arm something so at most one tool is hot at any given moment. */
+  const cancelOthers = (keep?: "npc" | "object" | "item" | "paint"): void => {
+    if (keep !== "npc") npcPlacer.cancel();
+    if (keep !== "object") objectPlacer.cancel();
+    if (keep !== "item") itemPlacer.cancel();
+    if (keep !== "paint") tilePainter.disarm();
+    refreshInspectorEnabled();
+  };
+
+  /**
+   * Turn the Shift-hover debug inspector off whenever any editor tool is
+   * active — otherwise the inspector's panel pops up and steals Shift
+   * from the placer's "about to delete" UX. Re-enables once everything is
+   * disarmed. Call after any arm/cancel/toggle across the tool set.
+   */
+  const refreshInspectorEnabled = (): void => {
+    const anyArmed =
+      npcPlacer.isArmed() ||
+      objectPlacer.isArmed() ||
+      itemPlacer.isArmed() ||
+      tilePainter.isArmed() ||
+      eyedropper.isArmed();
+    inspector.setEnabled(!anyArmed);
+  };
+
+  toolPanel = new ToolPanel({
+    onArmEntity: (tab, entry) => {
+      cancelOthers(tab);
+      modelPlacers[tab].arm(entry.id, entry.name);
+      refreshInspectorEnabled();
+    },
+    onPaintArm: (armed) => {
+      if (armed) {
+        cancelOthers("paint");
+        tilePainter.arm();
+      } else {
+        tilePainter.disarm();
+      }
+      refreshInspectorEnabled();
+    },
+    onPaintColor: (hex) => tilePainter.setColor(hex),
+    onCancel: () => cancelOthers(),
+    onClear: (target) => {
+      if (target === "npc" || target === "all") npcPlacer.clearAll();
+      if (target === "object" || target === "all") objectPlacer.clearAll();
+      if (target === "item" || target === "all") itemPlacer.clearAll();
+      if (target === "paint" || target === "all") tilePainter.clearAll();
+    },
+    onEyedropperArm: (armed) => {
+      if (armed) {
+        // Disarm every other tool — the eyedropper's whole job is to
+        // consume the next click exclusively.
+        cancelOthers();
+        eyedropper.arm();
+      } else {
+        eyedropper.disarm();
+      }
+      refreshInspectorEnabled();
+    },
+    onChangeNpcAnimation: (npcId, name, animationId) => {
+      // Re-arm with the override; the placer's arm() re-fetches (cached
+      // per (id, animId)) and the ghost updates on the next hover.
+      npcPlacer.arm(npcId, name, animationId);
+      refreshInspectorEnabled();
+    },
+    onSnapToTileToggle: (snap) => {
+      // Applies to every model-backed tool. TilePainter is grid-based by
+      // construction, so we leave it alone.
+      forEachModelPlacer((p) => p.setSnapToTile(snap));
+    },
+  });
+
+  // Panel renders the animation-picker once an NPC's bake resolves and
+  // exposes its menu. Objects/items don't populate this yet.
+  npcPlacer.onArmedAnimationInfo = (info) => toolPanel.showNpcAnimationPicker(info);
+
+  // Fire on both the button toggle and keyboard shortcut so the panel's
+  // armed-state pill stays in sync.
+  eyedropper.onArmChanged = (armed) => toolPanel.setEyedropperArmed(armed);
+  eyedropper.onPick = (result) => {
+    // Fetch the entity name from the matching catalog for the armed-state
+    // banner. We already have the id; the name is just for display.
+    const name = result.name ?? `#${result.id}`;
+    cancelOthers(result.kind);
+    modelPlacers[result.kind].arm(result.id, name);
+    toolPanel.onPickedEntity(result.kind, result.id, name);
+    refreshInspectorEnabled();
+  };
+  eyedropper.onMiss = () => {
+    // Keep the eyedropper armed and let the user try again. Only log.
+    console.info("[eyedropper] no matchable entity under cursor");
+  };
+
+  // "I" toggles the eyedropper — same behaviour as clicking the panel's
+  // pick button. Skipped when typing in a form input.
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "i" && e.key !== "I") return;
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (eyedropper.isArmed()) {
+      eyedropper.disarm();
+    } else {
+      // Mirror the panel button's arming path so all the other tools get
+      // cancelled first.
+      cancelOthers();
+      eyedropper.arm();
+    }
+    refreshInspectorEnabled();
+  });
+
+  // Rotation feedback from placers → panel banner. Only fires when one of
+  // the model placers is armed and the user hits R.
+  forEachModelPlacer((p) => {
+    p.onRotationChanged = (rot) => toolPanel.setRotation(rot);
+  });
+
+  // Escape cancels place mode regardless of focus — panel handles Escape
+  // when focus is on the search box, this covers canvas-focused case.
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") toolPanel.cancelArmed();
+  });
 
   // Finalize the streaming loader now that scene + inspector + planeCap
   // machinery all exist. `startLoad` was forward-declared above so the
@@ -321,6 +620,12 @@ async function main(): Promise<void> {
           terrainMeta: lr.region.terrainMeta,
           locsManifest: lr.region.locs,
           atlas: lr.region.atlas,
+          terrainGroup: lr.terrainGroup,
+          locsGroup: lr.locsGroup,
+        });
+        eyedropper.addRegion({
+          regionId: lr.regionId,
+          locsManifest: lr.region.locs,
           terrainGroup: lr.terrainGroup,
           locsGroup: lr.locsGroup,
         });
@@ -420,7 +725,12 @@ async function main(): Promise<void> {
     for (const lr of regions.values()) {
       if (lr.animated.length > 0) tickLocAnimations(lr.animated, nowMs - startTime);
     }
-    nightSky.update(camera.position, nowMs - startTime);
+    // Placed NPCs cycle their idle `standingAnimation` in place. Object
+    // placer has no animation today but the tick is a no-op over an
+    // empty placements list, cheap enough to call unconditionally.
+    npcPlacer.tick(nowMs);
+    objectPlacer.tick(nowMs);
+    skybox.update(camera.position, nowMs - startTime);
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
   };

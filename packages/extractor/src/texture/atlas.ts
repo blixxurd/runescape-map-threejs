@@ -166,6 +166,36 @@ function paintCellWithGutter(
   ctx.putImageData(img, slotX, slotY);
 }
 
+/**
+ * Enumerate every texture id in the cache's TEXTURES index and bake them
+ * into one atlas. Used by the dev server's `/api/texture-atlas` endpoint so
+ * placer-baked objects and NPCs can sample real textures — unlike the
+ * per-region atlases (which only include textures that region references).
+ *
+ * Build 234 has ~250 textures. Resulting PNG is ~3 MB; cache it in memory
+ * on the server and let the browser's HTTP cache handle repeat viewer
+ * reloads during dev.
+ */
+export async function buildGlobalAtlas(cache: RSCache): Promise<BakedAtlas> {
+  // `loadSprites: true` makes osrscachereader populate `def.sprites` while
+  // it loads the archive. The archive is cached after the first load, so
+  // if we enumerate without this flag the cached defs arrive spriteless
+  // and every subsequent `getDef(..., { loadSprites: true })` silently
+  // returns the stale sprite-less entry. Explicit `loadSprites: true`
+  // here seeds the cache correctly.
+  const defs =
+    (await cache.getAllDefs<{ id: number }>(IndexType.TEXTURES, 0, {
+      loadSprites: true,
+    })) ?? [];
+  const ids: number[] = [];
+  for (const d of defs) {
+    if (!d || typeof d.id !== "number") continue;
+    ids.push(d.id);
+  }
+  console.log(`[tex] global atlas: ${ids.length} texture ids enumerated`);
+  return buildAtlas(cache, ids);
+}
+
 export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): Promise<BakedAtlas> {
   const ids = [...new Set(textureIds)].sort((a, b) => a - b);
   // +1 for the solid white cell at index 0.

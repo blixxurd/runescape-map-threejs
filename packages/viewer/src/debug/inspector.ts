@@ -88,10 +88,25 @@ export class DebugInspector {
     this.raycastTargets.push(info.terrainGroup, info.locsGroup);
   }
 
+  /** Toggle the Shift-hover panel globally. `main.ts` disables the
+   *  inspector whenever any editor tool is armed so the debug overlay
+   *  doesn't steal Shift away from the delete-cursor UX. Re-enables
+   *  automatically once nothing is armed. */
+  setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) return;
+    this.enabled = enabled;
+    if (!enabled) {
+      this.shiftHeld = false;
+      this.panel.style.display = "none";
+    }
+  }
+
+  private enabled = true;
+
   private installListeners(): void {
     const dom = this.refs.renderer.domElement;
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Shift") this.shiftHeld = true;
+      if (e.key === "Shift" && this.enabled) this.shiftHeld = true;
     });
     window.addEventListener("keyup", (e) => {
       if (e.key === "Shift") {
@@ -103,8 +118,12 @@ export class DebugInspector {
       this.shiftHeld = false;
       this.panel.style.display = "none";
     });
-    dom.addEventListener("mousemove", (e) => this.onMouseMove(e));
+    dom.addEventListener("mousemove", (e) => {
+      if (!this.enabled) return;
+      this.onMouseMove(e);
+    });
     dom.addEventListener("click", (e) => {
+      if (!this.enabled) return;
       if (!e.shiftKey || !this.lastPasteBlock) return;
       e.preventDefault();
       e.stopPropagation();
