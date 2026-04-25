@@ -1,5 +1,11 @@
 import * as THREE from "three";
 import { TILE_SIZE } from "@rsmap/shared";
+import type {
+  PlacedMeshUserData,
+  PlacedRef,
+  Placer,
+  PlacerKind,
+} from "./placerTypes.js";
 
 /**
  * Generic "arm → click to place" tool for any entity whose server endpoint
@@ -36,7 +42,7 @@ export interface ModelPlacerConfig {
   /** Debug/scene name prefix for placed meshes. */
   meshNamePrefix: string;
   /** Logical tag put on each placed mesh's userData. */
-  kind: string;
+  kind: PlacerKind;
   /** Global atlas that matches the UVs the server emits. Placed meshes
    *  sample from this as their `map`; vertex colors are tint. */
   atlasTexture: THREE.Texture;
@@ -85,6 +91,19 @@ interface PlacedEntity {
   mesh: THREE.Mesh;
   id: number;
   name: string;
+  /** The bake this placement was built from. Held so `duplicate` /
+   *  `updatePose` (contour redeform) can re-run the same per-vertex math
+   *  without round-tripping the network cache. */
+  cached: CachedEntity;
+  /** `true` when `mesh.geometry` is a per-placement clone (contoured or
+   *  animated); `false` when it shares the cached bake's geometry. Drives
+   *  whether removeMesh disposes the geometry — disposing a shared one
+   *  would invalidate the cache for every other placement of the same id. */
+  ownsGeometry: boolean;
+  /** Sequence id active on this placement, if any. Mirrors `cached
+   *  .activeAnimationId` at construction time but kept separately so
+   *  `swapAnimation` can update it without mutating the cache. */
+  animationId?: number;
   /** Animation runtime state — present iff the entity is animated. The
    *  mesh's position attribute is mutable and owned by this placement
    *  (not shared with the cache) so swapping per-tick can't affect the
@@ -124,7 +143,8 @@ interface BakedResponse {
   availableAnimations?: Array<{ id: number; label: string }>;
 }
 
-export class ModelPlacer {
+export class ModelPlacer implements Placer {
+  readonly kind: PlacerKind;
   private readonly host: ModelPlacerHost;
   private readonly config: ModelPlacerConfig;
   private readonly group = new THREE.Group();
@@ -176,6 +196,10 @@ export class ModelPlacer {
 
   onPlacementsChanged: ((count: number) => void) | null = null;
   onRotationChanged: ((rot: number) => void) | null = null;
+  /** Fired after a placement is removed (shift-click delete or
+   *  selection's Delete key). Selection listens so it can clear stale
+   *  state if the removed mesh was the current selection. */
+  onMeshRemoved: ((mesh: THREE.Mesh) => void) | null = null;
   /** Fires once per successful `arm()` with whatever animation metadata
    *  the server returned (NPC-only today). Lets the panel show a picker
    *  of available sequences without the placer knowing about the DOM. */
@@ -190,6 +214,7 @@ export class ModelPlacer {
   constructor(host: ModelPlacerHost, config: ModelPlacerConfig) {
     this.host = host;
     this.config = config;
+    this.kind = config.kind;
     this.group.name = config.meshNamePrefix;
     this.group.userData.role = config.kind;
     host.scene.add(this.group);
@@ -303,12 +328,112 @@ export class ModelPlacer {
   }
 
   clearAll(): void {
+    const removed = this.placed.slice();
     for (const p of this.placed) {
       this.group.remove(p.mesh);
-      (p.mesh.geometry as THREE.BufferGeometry).dispose();
+      if (p.ownsGeometry) (p.mesh.geometry as THREE.BufferGeometry).dispose();
     }
     this.placed.length = 0;
     this.onPlacementsChanged?.(0);
+    if (this.onMeshRemoved) for (const p of removed) this.onMeshRemoved(p.mesh);
+  }
+
+  /** Selection-facing snapshot of every placement. Returns plain refs so
+   *  callers don't accidentally mutate internal state. */
+  getPlacements(): PlacedRef[] {
+    return this.placed.map((p) => ({
+      mesh: p.mesh,
+      kind: this.kind,
+      id: p.id,
+      name: p.name,
+      animationId: p.animationId,
+      availableAnimations: p.cached.availableAnimations,
+    }));
+  }
+
+  /** Move + rotate a placement. Y is re-clamped to the terrain at the new
+   *  XZ when terrain is loaded under that point — placements always sit on
+   *  the ground, matching how they were originally placed. Contoured
+   *  placements re-run their slope deformation against the new pose. */
+  updatePose(mesh: THREE.Mesh, position: THREE.Vector3, rotationRad: number): void {
+    const placement = this.placed.find((p) => p.mesh === mesh);
+    if (!placement) return;
+    const sampledY = this.host.sampleTerrainAt(position.x, position.z);
+    const finalY = sampledY ?? position.y;
+    mesh.position.set(position.x, finalY, position.z);
+    mesh.rotation.y = rotationRad;
+    if (placement.cached.contouredGround !== undefined) {
+      // Re-deform against the new world position. We need the placement's
+      // OWN geometry (must be a clone, since contoured placements always
+      // own their geometry).
+      const geom = mesh.geometry as THREE.BufferGeometry;
+      applyContourDeformation(
+        placement.cached.basePositions,
+        geom.attributes.position as THREE.BufferAttribute,
+        placement.cached.modelHeight,
+        placement.cached.contouredGround,
+        { position: mesh.position, rotationRad },
+        this.host.sampleTerrainAt,
+      );
+    }
+  }
+
+  /** Remove a placement by mesh reference. Used both by shift-click delete
+   *  and by selection's Delete-key path. */
+  removeMesh(mesh: THREE.Mesh): void {
+    const idx = this.placed.findIndex((p) => p.mesh === mesh);
+    if (idx < 0) return;
+    const placement = this.placed[idx]!;
+    this.group.remove(mesh);
+    if (placement.ownsGeometry) {
+      (mesh.geometry as THREE.BufferGeometry).dispose();
+    }
+    this.placed.splice(idx, 1);
+    this.onPlacementsChanged?.(this.placed.length);
+    this.onMeshRemoved?.(mesh);
+  }
+
+  /** Clone a placement at the same pose, animation, and bake. Used by the
+   *  selection inspector's Duplicate button (Cmd/Ctrl+D). */
+  duplicate(mesh: THREE.Mesh): void {
+    const src = this.placed.find((p) => p.mesh === mesh);
+    if (!src) return;
+    this.spawnPlacement(src.id, src.name, src.cached, {
+      position: mesh.position.clone(),
+      rotationRad: mesh.rotation.y,
+    });
+  }
+
+  /** Swap the animation on an existing placement. Re-fetches via the bake
+   *  cache (keyed per `(id, animationId)` so each variant is built once),
+   *  rebuilds the placement's geometry around the new frames, and resets
+   *  the per-placement animation clock so it starts at frame 0. */
+  async swapAnimation(mesh: THREE.Mesh, animationId: number): Promise<void> {
+    const placement = this.placed.find((p) => p.mesh === mesh);
+    if (!placement) return;
+    const newCached = await this.getOrFetch(placement.id, animationId);
+    // Bail if the placement was removed while the fetch was in flight.
+    if (!this.placed.includes(placement)) return;
+    const pose = {
+      position: mesh.position.clone(),
+      rotationRad: mesh.rotation.y,
+    };
+    const { geom, owns } = this.buildGeometryFor(newCached, pose);
+    const oldGeom = mesh.geometry as THREE.BufferGeometry;
+    mesh.geometry = geom;
+    if (placement.ownsGeometry) oldGeom.dispose();
+    placement.cached = newCached;
+    placement.ownsGeometry = owns;
+    placement.animationId = newCached.activeAnimationId;
+    if (newCached.animation) {
+      placement.animation = {
+        data: newCached.animation,
+        startMs: performance.now(),
+        lastFrameApplied: -1,
+      };
+    } else {
+      delete placement.animation;
+    }
   }
 
   private handleKey(e: KeyboardEvent): void {
@@ -387,7 +512,7 @@ export class ModelPlacer {
       );
     }
     this.ghostMesh.position.copy(pose.position);
-    this.ghostMesh.rotation.y = (pose.rotation * Math.PI) / 4;
+    this.ghostMesh.rotation.y = pose.rotationRad;
     this.ghostMesh.visible = true;
   }
 
@@ -396,11 +521,11 @@ export class ModelPlacer {
   }
 
   /** Placement pose for the armed entity at a raycast hit. Tile-center
-   *  snap on XZ, user-controlled `placementRotation`. Kept as a helper
-   *  so the ghost and the real placement share the same math. */
+   *  snap on XZ, user-controlled `placementRotation` (eighth-turns)
+   *  converted to radians here so callers don't repeat the math. */
   private resolvePose(worldPoint: THREE.Vector3): {
     position: THREE.Vector3;
-    rotation: number;
+    rotationRad: number;
   } {
     // Free placement uses the raw hit (clone it so callers can't mutate
     // the raycaster's internal Vector3); tile snap drops to the centre of
@@ -408,7 +533,7 @@ export class ModelPlacer {
     const position = this.snapToTile
       ? snapToTileCenter(worldPoint)
       : worldPoint.clone();
-    return { position, rotation: this.placementRotation };
+    return { position, rotationRad: (this.placementRotation * Math.PI) / 4 };
   }
 
   private handleRightClick(e: MouseEvent): void {
@@ -449,13 +574,23 @@ export class ModelPlacer {
     // Same resolver as the ghost so the real placement matches the preview.
     // Pulls either user-rotation (default objects) or edge-snap (walls).
     const pose = this.resolvePose(hit.point);
-    // Contoured and animated placements both need their own geometry:
-    // contoured because the deformation is per-placement, animated because
-    // we overwrite the position attribute each tick. Static rigid entities
-    // reuse the cached shared geometry for zero-copy instancing.
-    let geom = baked.geometry;
+    this.spawnPlacement(armedIdSnapshot, armedNameSnapshot, baked, pose);
+  }
+
+  /**
+   * Build a per-placement geometry from a bake at the given pose. Returns
+   * the geometry plus an `owns` flag — `true` means the geometry is a
+   * fresh per-placement clone (contoured / animated) and the placement
+   * must dispose it on removal; `false` means it shares the cached bake's
+   * geometry (rigid static), and disposing would invalidate the cache for
+   * every other placement of the same id.
+   */
+  private buildGeometryFor(
+    baked: CachedEntity,
+    pose: { position: THREE.Vector3; rotationRad: number },
+  ): { geom: THREE.BufferGeometry; owns: boolean } {
     if (baked.contouredGround !== undefined) {
-      geom = baked.geometry.clone();
+      const geom = baked.geometry.clone();
       applyContourDeformation(
         baked.basePositions,
         geom.attributes.position as THREE.BufferAttribute,
@@ -464,10 +599,12 @@ export class ModelPlacer {
         pose,
         this.host.sampleTerrainAt,
       );
-    } else if (baked.animation) {
+      return { geom, owns: true };
+    }
+    if (baked.animation) {
       // Share color + uv with the cached geometry (they don't change
       // across frames); only `position` needs a writable copy.
-      geom = new THREE.BufferGeometry();
+      const geom = new THREE.BufferGeometry();
       const mutablePositions = new Float32Array(baked.basePositions.length);
       mutablePositions.set(baked.animation.framePositions[0]!);
       geom.setAttribute("position", new THREE.BufferAttribute(mutablePositions, 3));
@@ -476,19 +613,41 @@ export class ModelPlacer {
       geom.setAttribute("color", srcColor);
       geom.setAttribute("uv", srcUv);
       geom.boundingSphere = baked.geometry.boundingSphere;
+      return { geom, owns: true };
     }
+    return { geom: baked.geometry, owns: false };
+  }
+
+  /**
+   * Common path for `handleClick` and `duplicate`: take a resolved bake +
+   * pose, build the mesh, register the placement, fire the change callback.
+   */
+  private spawnPlacement(
+    id: number,
+    name: string,
+    baked: CachedEntity,
+    pose: { position: THREE.Vector3; rotationRad: number },
+  ): PlacedEntity {
+    const { geom, owns } = this.buildGeometryFor(baked, pose);
     const mesh = new THREE.Mesh(geom, this.material);
     mesh.position.copy(pose.position);
-    mesh.rotation.y = (pose.rotation * Math.PI) / 4;
-    mesh.name = `${this.config.meshNamePrefix}:${armedIdSnapshot}`;
-    mesh.userData = {
+    mesh.rotation.y = pose.rotationRad;
+    mesh.name = `${this.config.meshNamePrefix}:${id}`;
+    const userData: PlacedMeshUserData = {
       kind: this.config.kind,
-      id: armedIdSnapshot,
-      name: armedNameSnapshot,
-      rotation: pose.rotation,
+      id,
+      name,
     };
+    mesh.userData = userData;
     this.group.add(mesh);
-    const placement: PlacedEntity = { mesh, id: armedIdSnapshot, name: armedNameSnapshot };
+    const placement: PlacedEntity = {
+      mesh,
+      id,
+      name,
+      cached: baked,
+      ownsGeometry: owns,
+      animationId: baked.activeAnimationId,
+    };
     if (baked.animation) {
       placement.animation = {
         data: baked.animation,
@@ -500,6 +659,7 @@ export class ModelPlacer {
     }
     this.placed.push(placement);
     this.onPlacementsChanged?.(this.placed.length);
+    return placement;
   }
 
   /**
@@ -558,13 +718,7 @@ export class ModelPlacer {
       false,
     );
     if (hits.length === 0) return;
-    const target = hits[0]!.object as THREE.Mesh;
-    const idx = this.placed.findIndex((p) => p.mesh === target);
-    if (idx < 0) return;
-    this.group.remove(target);
-    (target.geometry as THREE.BufferGeometry).dispose();
-    this.placed.splice(idx, 1);
-    this.onPlacementsChanged?.(this.placed.length);
+    this.removeMesh(hits[0]!.object as THREE.Mesh);
   }
 
   private raycastTerrain(e: MouseEvent): THREE.Intersection | null {
@@ -687,12 +841,12 @@ function applyContourDeformation(
   outAttr: THREE.BufferAttribute,
   modelHeight: number,
   contouredThreshold: number,
-  pose: { position: THREE.Vector3; rotation: number },
+  pose: { position: THREE.Vector3; rotationRad: number },
   sample: (worldX: number, worldZ: number) => number | null,
 ): void {
   const out = outAttr.array as Float32Array;
-  const cos = Math.cos((pose.rotation * Math.PI) / 4);
-  const sin = Math.sin((pose.rotation * Math.PI) / 4);
+  const cos = Math.cos(pose.rotationRad);
+  const sin = Math.sin(pose.rotationRad);
   const baseTerrain = pose.position.y;
   // Opcode 81 uses `yRatio = vy / modelHeight` (0 at the base, 1 at the
   // tallest vertex). The threshold, stored as `byte × 256`, is compared

@@ -1,70 +1,24 @@
 # RuneScape Map — Three.js
 
-A browser map viewer for Old School RuneScape. Extracts raw cache data from
-the [openrs2 archive](https://archive.openrs2.org/) into static Three.js-ready
-bundles, then renders them with a Vite + Three.js frontend.
+> A browser-based map viewer and scene editor for Old School RuneScape.
 
-Not affiliated with Jagex. This is an educational/research project that reads
-public cache snapshots.
+Decodes snapshots of the OSRS cache from the
+[openrs2 archive](https://archive.openrs2.org/) into static, Three.js-ready
+region bundles, then renders them with a Vite + Three.js frontend. On top of
+the rendered world there's an in-browser editor for arranging scenes —
+placing NPCs, objects, and items, selecting and manipulating them with a 3D
+gizmo, all session-only (no persistence yet).
 
-## What works
+Not affiliated with Jagex. Educational/research project that reads public
+cache snapshots; OSRS cache data is © Jagex Ltd.
 
-**Rendering**
+[Quick start](#quick-start) · [Editor controls](#editor-controls) ·
+[Architecture](#architecture) · [Limitations](#limitations) ·
+[Contributing](#contributing)
 
-- 64×64 map regions rendered as a single BufferGeometry per plane, with
-  baked OSRS-accurate per-vertex lighting.
-- Underlay + overlay tile blending, overlay shape table, and shared
-  texture atlas for terrain + locs.
-- Static scenery (locs): decoded models, per-face HSL and textures,
-  recolor/retexture substitutions, contoured-ground deformation for
-  fences / trees / rocks.
-- Scenery animation: every sequence frame baked in the extractor, swapped
-  by `BufferGeometry.position` on a 50 Hz tick matching the client.
-- Multi-region grid (3×3 default, scalable) with seam-consistent
-  terrain blending and contoured-loc heights.
-- On-demand region extraction: visit `?region=<id>` and the dev server
-  extracts the bundle in-process if it hasn't been generated yet.
+---
 
-**Editor tools** (top-right panel)
-
-- **NPCs** — search ~12k NPCs, click to arm, click terrain to place.
-  Animations auto-loop; pick from the NPC's declared animations or
-  search the full 12k-sequence catalog ("more animations ▾").
-- **Objects** — search ~28k baked locs (walls, scenery, doors, crates).
-  R rotates in 45° steps (supports diagonal fences). Contoured objects
-  follow terrain slopes; animated ones (mills, fires, banners) cycle
-  frames.
-- **Items** — search ~5k items; drops the inventory-model on the
-  ground at click position.
-- **Paint** — color picker + click to tint a tile.
-- **Eyedropper (I)** — click any baked loc to grab its id and re-arm
-  the Object tool for placing copies.
-- **Free placement** toggle — disable tile-center snap for precise
-  off-grid positioning.
-- **Shift+click a placement** — delete it (cursor flips to a red X
-  while Shift is held).
-- **Debug inspector** — when nothing is armed, hold **Shift** to see
-  cache data behind any tile or loc; **Shift+click** copies a
-  paste-ready block.
-
-## What doesn't (yet)
-
-- Upper floors — decoded but hidden; the client's auto-roof-removal is
-  not implemented.
-- Water, water animation, and most dynamic effects.
-- Per-instance animation phase (neighbouring animated locs move in
-  sync).
-- Streaming / LOD for whole-world rendering. See
-  [`docs/scaling.md`](docs/scaling.md) for the plan.
-- Editor state is session-only (not persisted across reloads).
-- Attack/emote animations for NPCs live in game scripts, not the cache
-  — the "more animations" search lets you try any sequence id but
-  mismatched skeletons will render oddly.
-
-A fuller list of intentional scope cuts lives in
-[`CLAUDE.md`](CLAUDE.md) under "Known M1 limitations".
-
-## Run it
+## Quick start
 
 Requires Node 20+ and [pnpm](https://pnpm.io/).
 
@@ -74,15 +28,14 @@ pnpm dev
 # → http://127.0.0.1:5173/?region=12850   (Lumbridge)
 ```
 
-On first load the dev server will download the pinned OSRS cache
-snapshot (~140 MB into `.cache/`, gitignored) and extract the region
-bundle. Subsequent loads are instant.
+On first load, the dev server downloads the pinned OSRS cache snapshot
+(~140 MB into `.cache/`, gitignored) and extracts the region bundle on
+demand. Subsequent loads are instant. Switch regions by changing the URL —
+valid IDs are `(regionX << 8) | regionZ` with both axes in `[0, 255]`.
 
-Jump to any region by changing the URL — valid region IDs are
-`(regionX << 8) | regionZ`, 0 ≤ regionX, regionZ ≤ 255. A few good
-starting points:
+A few good starting points:
 
-| region | place |
+| Region | Place |
 |---|---|
 | `12850` | Lumbridge |
 | `12342` | Varrock |
@@ -96,26 +49,174 @@ pnpm extract -- --region 12342
 pnpm extract -- --region 12342 --build 230   # override the pinned build
 ```
 
+To bulk re-extract every region you've previously visited (e.g. after an
+extractor bug fix that requires regenerating bundles):
+
+```bash
+pnpm --filter @rsmap/extractor exec tsx scripts/reextract-all.ts
+```
+
+---
+
+## What works
+
+### Rendering
+
+- Full 64×64 region terrain with OSRS-accurate per-vertex baked lighting
+  (port of `Landscape.mixLightness`).
+- Underlay + overlay tile blending, overlay shape table, shared texture
+  atlas for terrain and locs.
+- Static scenery (locs): decoded models, per-face HSL and textures, recolor
+  / retexture substitutions, contoured-ground deformation for fences /
+  trees / rocks.
+- Scenery animation: every sequence frame is baked at extract time; the
+  viewer swaps `BufferGeometry.position` on a 50 Hz tick matching the
+  client (`frameLengths[i] × 20ms`).
+- Multi-region grid (3×3 default, scalable) with seam-consistent terrain
+  blending and contoured-loc heights.
+- On-demand region extraction via Vite middleware: visiting `?region=<id>`
+  triggers an in-process bake if the bundle isn't on disk yet.
+
+### Editor
+
+The top-right tool panel covers placement; the rest is mouse-driven on the
+selected entity.
+
+| Tool | What it does |
+|---|---|
+| **NPCs** | Search ~12k NPCs, click to arm, click terrain to place. Idle animations auto-loop. NPC's declared animations are in a per-arm dropdown; "more animations ▾" searches the full ~12k sequence catalog. |
+| **Objects** | Search ~28k baked locs (walls, scenery, doors, crates). `R` rotates in 45° steps; contoured objects follow terrain slopes; animated ones (mills, fires, banners) cycle frames. |
+| **Items** | Search ~5k items; drops the inventory model on the ground at click position. |
+| **Eyedropper (`I`)** | Click any baked loc in the world to grab its id and re-arm the Object tool. |
+| **Free placement** | Toggle in panel head — disables tile-center snap for off-grid positioning. |
+
+### Selection (no tool armed)
+
+Click any placement to select it — a cyan outline highlights the mesh and
+a floating inspector panel appears.
+
+| Action | Key |
+|---|---|
+| Translate handle (XZ ground-plane, Y re-clamps to terrain) | `T` (default) |
+| Rotate handle (Y axis, 45° snap; Shift = free angle) | `R` |
+| Deselect | `Esc`, click empty terrain |
+| Delete | `Delete` / `Backspace`, or Inspector → Delete |
+| Duplicate at same pose | `Cmd/Ctrl+D`, or Inspector → Duplicate |
+| Nudge by one tile (Shift = 1 unit) | Arrow keys |
+| Edit position / rotation numerically | Inspector fields |
+| Override animation (NPCs only) | Inspector dropdown |
+
+Arming a placer auto-deselects so the gizmo and ghost preview don't fight
+over the canvas.
+
+### Debug overlay
+
+With nothing armed and nothing selected, hold **Shift** to inspect the tile
+or loc under the cursor (plane, coords, underlay/overlay ids, blended HSL,
+loc type/rotation, face counts). **Shift+click** copies a paste-ready block —
+the preferred way to report visual bugs.
+
+---
+
+## Architecture
+
+```
+.cache/<openrs2-id>/cache/        downloaded disk.zip + xteas.json
+          │
+          ▼
+packages/extractor/   Node CLI — decodes one region → static bundle
+          │            uses osrscachereader for cache I/O + XTEA
+          ▼
+packages/viewer/public/regions/<id>/
+  terrain.meta.json  + terrain.{pos,col,uv,heights}.bin
+  locs.json          + locs.{pos,col,uv}.bin    + locs.frames.pos.bin
+  atlas.json         + atlas.png        (shared by terrain + locs)
+          │
+          ▼
+packages/viewer/     Vite + Three.js app — fetches bundle, builds
+                     BufferGeometry + InstancedMesh per (locId, type)
+```
+
+Extractor runs offline (Node); viewer only reads static files. The on-disk
+schema is declared once in `shared/src/region-bundle.ts` and imported by
+both packages.
+
+Coordinate convention: world is right-handed `+X = east`, `+Y = up`,
+`+Z = south` (Three.js camera-friendly). The extractor negates both Y and
+Z on every vertex from the OSRS client's convention; both flips together
+preserve handedness so triangle winding from the OSRS tile-shape tables
+carries over unchanged. Region extent: X ∈ [0, 8064], Z ∈ [−8064, 0].
+
+For the deeper architectural breakdown see [`CLAUDE.md`](CLAUDE.md). For
+the plan to scale past a 3×3 grid, see [`docs/scaling.md`](docs/scaling.md).
+
+---
+
+## Limitations
+
+These are intentional scope cuts, not bugs:
+
+- **Plane 0 only.** Upper floors decode but the viewer hides them — the
+  client's auto-roof-removal is not implemented.
+- **No water / water animation** and most dynamic effects.
+- **Per-instance animation phase not randomized** — neighbouring identical
+  animated locs move in sync.
+- **No streaming / LOD** for whole-world rendering.
+  See [`docs/scaling.md`](docs/scaling.md) for the plan.
+- **Editor is session-only** — placements don't persist across reloads.
+- **Attack/emote NPC animations** live in game scripts (not the cache);
+  the "more animations" search lets you try any sequence id, but
+  mismatched skeletons will render oddly.
+
+A fuller list lives in [`CLAUDE.md`](CLAUDE.md) under *Known M1
+limitations*.
+
+---
+
 ## Build a static site
 
-`pnpm build` produces a plain static bundle in `packages/viewer/dist/`.
-The static build has no extractor middleware, so every region you want
-to ship must be extracted ahead of time into
+`pnpm build` produces a plain static bundle in `packages/viewer/dist/`. The
+static build has no extractor middleware, so every region you want to ship
+must be extracted ahead of time into
 `packages/viewer/public/regions/<id>/`.
+
+---
 
 ## Repo layout
 
 ```
 packages/
   extractor/   Node CLI and importable API — cache → region bundle
+    scripts/   one-off ops scripts (bulk re-extract, etc.)
   viewer/      Vite + Three.js app
 shared/        On-disk bundle schema (imported by both)
-docs/          scaling.md, etc.
+docs/          scaling.md, design notes
 reference/     Reference OSRS client sources (gitignored)
 ```
 
-- [`CLAUDE.md`](CLAUDE.md) — architectural overview and intentional scope cuts.
-- [`docs/scaling.md`](docs/scaling.md) — plan for rendering past a 3×3 grid.
+Worth reading next:
+
+- [`CLAUDE.md`](CLAUDE.md) — architectural overview and intentional scope
+  cuts.
+- [`docs/scaling.md`](docs/scaling.md) — plan for rendering past a 3×3
+  grid.
+
+---
+
+## Contributing
+
+The repo is single-author for now. If you found a visual bug, the
+**Shift+click** debug-inspector copy is the fastest way to share enough
+context to investigate (cache ids + raw values + blended results).
+
+Type-check + build before committing:
+
+```bash
+pnpm typecheck
+pnpm build
+```
+
+---
 
 ## License
 

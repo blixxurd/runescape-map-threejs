@@ -15,8 +15,9 @@ import { createSkybox, type SkyPreset } from "./sky/skybox.js";
 import { EnvironmentPanel } from "./sky/environmentPanel.js";
 import { ToolPanel } from "./tools/toolPanel.js";
 import { ModelPlacer } from "./tools/modelPlacer.js";
-import { TilePainter } from "./tools/tilePainter.js";
 import { Eyedropper } from "./tools/eyedropper.js";
+import { Selection } from "./tools/selection.js";
+import { InspectorPanel } from "./tools/inspectorPanel.js";
 import { loadGlobalAtlas } from "./tools/globalAtlas.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
@@ -302,12 +303,11 @@ async function main(): Promise<void> {
       `center ${CENTER_REGION_ID}  build ${BUILD_ID ?? "?"}  under camera: ${camId}\n` +
         `${regions.size} regions loaded${inflight.length > 0 ? " · " + inflight.join(" · ") : ""}` +
         (failed.size > 0 ? `  (skipped ${failed.size})` : "") +
-        (counts.npc + counts.object + counts.item + counts.paint > 0
+        (counts.npc + counts.object + counts.item > 0
           ? `  · placed: ${[
               counts.npc ? `${counts.npc} npc` : "",
               counts.object ? `${counts.object} obj` : "",
               counts.item ? `${counts.item} item` : "",
-              counts.paint ? `${counts.paint} tile` : "",
             ].filter(Boolean).join(", ")}`
           : "") +
         `\nvisible: plane 0..${planeCap}   [ / ] to change   H: hide UI\n` +
@@ -432,7 +432,6 @@ async function main(): Promise<void> {
     kind: "item",
     atlasTexture: globalAtlas.texture,
   });
-  const tilePainter = new TilePainter(toolHost);
   const eyedropper = new Eyedropper({
     camera,
     canvas: renderer.domElement,
@@ -445,7 +444,7 @@ async function main(): Promise<void> {
     ],
   });
 
-  const counts = { npc: 0, object: 0, item: 0, paint: 0 };
+  const counts = { npc: 0, object: 0, item: 0 };
   npcPlacer.onPlacementsChanged = (n) => {
     counts.npc = n;
     updateHud();
@@ -458,10 +457,6 @@ async function main(): Promise<void> {
     counts.item = n;
     updateHud();
   };
-  tilePainter.onPlacementsChanged = (n) => {
-    counts.paint = n;
-    updateHud();
-  };
 
   const modelPlacers = { npc: npcPlacer, object: objectPlacer, item: itemPlacer };
 
@@ -471,13 +466,20 @@ async function main(): Promise<void> {
     fn(objectPlacer);
     fn(itemPlacer);
   };
+  /** Forward-declared so `cancelOthers` and `refreshInspectorEnabled` can
+   *  see the selection. Filled in once `Selection` is constructed below.
+   *  `?.` guards work even before assignment because optional chaining
+   *  treats `null` / `undefined` as a no-op. */
+  let selection: Selection | null = null;
   /** Cancel every tool except `keep` (if provided). Used every time we
-   *  arm something so at most one tool is hot at any given moment. */
-  const cancelOthers = (keep?: "npc" | "object" | "item" | "paint"): void => {
+   *  arm something so at most one tool is hot at any given moment. Also
+   *  drops any current selection — arming a placer auto-deselects so
+   *  the gizmo and the placement ghost can't fight over the canvas. */
+  const cancelOthers = (keep?: "npc" | "object" | "item"): void => {
     if (keep !== "npc") npcPlacer.cancel();
     if (keep !== "object") objectPlacer.cancel();
     if (keep !== "item") itemPlacer.cancel();
-    if (keep !== "paint") tilePainter.disarm();
+    selection?.deselect();
     refreshInspectorEnabled();
   };
 
@@ -492,9 +494,12 @@ async function main(): Promise<void> {
       npcPlacer.isArmed() ||
       objectPlacer.isArmed() ||
       itemPlacer.isArmed() ||
-      tilePainter.isArmed() ||
       eyedropper.isArmed();
-    inspector.setEnabled(!anyArmed);
+    // Also turn off the Shift-hover debug inspector while a placement is
+    // selected — Shift is reserved for the gizmo's free-angle modifier
+    // and we don't want a tile-data popup distracting from the edit.
+    const selecting = selection?.hasSelection() ?? false;
+    inspector.setEnabled(!anyArmed && !selecting);
   };
 
   toolPanel = new ToolPanel({
@@ -503,22 +508,11 @@ async function main(): Promise<void> {
       modelPlacers[tab].arm(entry.id, entry.name);
       refreshInspectorEnabled();
     },
-    onPaintArm: (armed) => {
-      if (armed) {
-        cancelOthers("paint");
-        tilePainter.arm();
-      } else {
-        tilePainter.disarm();
-      }
-      refreshInspectorEnabled();
-    },
-    onPaintColor: (hex) => tilePainter.setColor(hex),
     onCancel: () => cancelOthers(),
     onClear: (target) => {
       if (target === "npc" || target === "all") npcPlacer.clearAll();
       if (target === "object" || target === "all") objectPlacer.clearAll();
       if (target === "item" || target === "all") itemPlacer.clearAll();
-      if (target === "paint" || target === "all") tilePainter.clearAll();
     },
     onEyedropperArm: (armed) => {
       if (armed) {
@@ -587,6 +581,47 @@ async function main(): Promise<void> {
   forEachModelPlacer((p) => {
     p.onRotationChanged = (rot) => toolPanel.setRotation(rot);
   });
+
+  // Selection: click-to-select user-placed entities. Owns the OutlinePass
+  // composer, so the tick loop renders via `selection.render()` rather
+  // than the bare `renderer.render(...)`. Construction must come after
+  // every placer has registered its click listener so selection's bubble
+  // handler runs last and can defer to armed placers.
+  selection = new Selection({
+    scene,
+    camera,
+    renderer,
+    canvas: renderer.domElement,
+    getPlacers: () => [npcPlacer, objectPlacer, itemPlacer],
+    isAnyToolArmed: () =>
+      npcPlacer.isArmed() ||
+      objectPlacer.isArmed() ||
+      itemPlacer.isArmed() ||
+      eyedropper.isArmed(),
+    onDraggingChanged: (dragging) => {
+      // Pause orbit during gizmo drag — otherwise mouse-look fires while
+      // the user is dragging a translate/rotate handle.
+      controls.enabled = !dragging;
+    },
+  });
+  // Refresh the debug-inspector gate whenever selection state changes —
+  // selecting silences the Shift-hover panel; deselecting restores it.
+  selection.onSelectionChanged = (info) => {
+    refreshInspectorEnabled();
+    inspectorPanel.handleSelectionChanged(info);
+  };
+  selection.onPoseChanged = (info) => inspectorPanel.handlePoseChanged(info);
+  selection.onGizmoModeChanged = (mode) => inspectorPanel.handleGizmoModeChanged(mode);
+  // Drop the selection if the placer reports its mesh was removed (shift-
+  // click delete or `clearAll`) — outlining a vanished mesh is a crash
+  // waiting to happen.
+  forEachModelPlacer((p) => {
+    p.onMeshRemoved = (mesh) => selection!.notifyMeshRemoved(mesh);
+  });
+
+  // Inspector panel — listens to selection events and pushes property
+  // edits back through the placer's mutation methods.
+  const inspectorPanel = new InspectorPanel({ selection });
 
   // Escape cancels place mode regardless of focus — panel handles Escape
   // when focus is on the search box, this covers canvas-focused case.
@@ -731,7 +766,7 @@ async function main(): Promise<void> {
     npcPlacer.tick(nowMs);
     objectPlacer.tick(nowMs);
     skybox.update(camera.position, nowMs - startTime);
-    renderer.render(scene, camera);
+    selection.render();
     requestAnimationFrame(tick);
   };
   tick();
@@ -740,6 +775,7 @@ async function main(): Promise<void> {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    selection.setSize(window.innerWidth, window.innerHeight);
   });
 }
 

@@ -13,27 +13,22 @@ import {
 import { animationName, knownNamedAnimations } from "./animationNames.js";
 
 /**
- * Tabbed side panel for the editor tools: NPCs, Objects, Items, Paint.
+ * Tabbed side panel for the editor tools: NPCs, Objects, Items.
  *
- * Each tab drives a different host-side tool (ModelPlacer × 3, TilePainter).
- * The panel itself is a dumb view over two pieces of state: the active tab
- * and the catalog contents. Interactions bubble out through the `host`
- * callbacks — the panel never touches the scene or the placer internals.
+ * Each tab drives a host-side ModelPlacer. The panel itself is a dumb view
+ * over two pieces of state: the active tab and the catalog contents.
+ * Interactions bubble out through the `host` callbacks — the panel never
+ * touches the scene or the placer internals.
  */
-export type ToolTab = "npc" | "object" | "item" | "paint";
 export type ModelTab = "npc" | "object" | "item";
 
 export interface ToolPanelHost {
   /** User clicked a result in one of the model-backed tabs. */
   onArmEntity(tab: ModelTab, entry: NamedEntry): void;
-  /** User toggled the Paint tool on/off. */
-  onPaintArm(armed: boolean): void;
-  /** User picked a new tile-paint color. */
-  onPaintColor(hex: string): void;
   /** User clicked cancel or pressed Escape while armed. */
   onCancel(): void;
   /** User clicked "clear all" for a specific tool. Unknown = every tool. */
-  onClear(target: ModelTab | "paint" | "all"): void;
+  onClear(target: ModelTab | "all"): void;
   /** User toggled the world-pick eyedropper. */
   onEyedropperArm(armed: boolean): void;
   /** User picked a different animation for the currently-armed NPC.
@@ -106,15 +101,12 @@ function injectStyles(): void {
     }
     #toolPanel .panel { display: none; flex-direction: column; gap: 6px; }
     #toolPanel .panel.active { display: flex; }
-    #toolPanel input.search, #toolPanel input[type="color"] {
+    #toolPanel input.search {
       background: #10131d; color: #e6e8ec;
       border: 1px solid #2a334a; border-radius: 3px;
       padding: 4px 6px; font: inherit; outline: none;
     }
     #toolPanel input.search:focus { border-color: #7aa6d6; }
-    #toolPanel input[type="color"] { padding: 2px; height: 28px; cursor: pointer; }
-    #toolPanel .row { display: flex; gap: 6px; align-items: center; }
-    #toolPanel .row > * { flex: 1; }
     #toolPanel .status { color: #8f9bb5; min-height: 14px; }
     #toolPanel .armed {
       background: #2d4b2d; color: #e8f5e8; padding: 4px 6px; border-radius: 3px;
@@ -163,24 +155,21 @@ function injectStyles(): void {
 export class ToolPanel {
   private readonly host: ToolPanelHost;
   private readonly root: HTMLDivElement;
-  private readonly panels: Record<ToolTab, HTMLDivElement>;
+  private readonly panels: Record<ModelTab, HTMLDivElement>;
   private readonly resultsEls: Record<ModelTab, HTMLDivElement>;
   private readonly searchInputs: Record<ModelTab, HTMLInputElement>;
   private readonly statusEls: Record<ModelTab, HTMLDivElement>;
-  private readonly armedBanners: Record<ToolTab, HTMLDivElement>;
-  private readonly tabBtns: Record<ToolTab, HTMLButtonElement>;
-  private readonly paintColorInput: HTMLInputElement;
-  private readonly paintToggle: HTMLButtonElement;
+  private readonly armedBanners: Record<ModelTab, HTMLDivElement>;
+  private readonly tabBtns: Record<ModelTab, HTMLButtonElement>;
   private readonly eyedropperBtn: HTMLButtonElement;
   private readonly freePlaceBtn: HTMLButtonElement;
 
-  private activeTab: ToolTab = "npc";
+  private activeTab: ModelTab = "npc";
   private readonly tabStates: Record<ModelTab, TabState> = {
     npc: { catalog: null, error: null, query: "", armedId: null },
     object: { catalog: null, error: null, query: "", armedId: null },
     item: { catalog: null, error: null, query: "", armedId: null },
   };
-  private paintArmed = false;
 
   constructor(host: ToolPanelHost) {
     this.host = host;
@@ -205,7 +194,6 @@ export class ToolPanel {
         <button data-tab="npc" class="active">NPCs</button>
         <button data-tab="object">Objects</button>
         <button data-tab="item">Items</button>
-        <button data-tab="paint">Paint</button>
       </div>
       <div class="body">
         <div class="panel panel-npc active" data-tab="npc">
@@ -229,20 +217,10 @@ export class ToolPanel {
           <div class="results"></div>
           <div class="hint">ground items use the inventory model. <b>R</b> rotates.</div>
         </div>
-        <div class="panel panel-paint" data-tab="paint">
-          <div class="row">
-            <label>color</label>
-            <input type="color" value="#ffb347" />
-          </div>
-          <button class="action primary paint-toggle" type="button">arm paint mode</button>
-          <div class="armed" style="display:none"></div>
-          <div class="hint">snaps to tile grid. <b>shift+click</b> a painted tile to erase.</div>
-        </div>
         <div class="actions">
           <button class="action" data-clear="npc" type="button">clear NPCs</button>
           <button class="action" data-clear="object" type="button">clear objects</button>
           <button class="action" data-clear="item" type="button">clear items</button>
-          <button class="action" data-clear="paint" type="button">clear paint</button>
           <button class="action" data-clear="all" type="button">clear all</button>
         </div>
       </div>
@@ -253,13 +231,11 @@ export class ToolPanel {
       npc: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="npc"]')!,
       object: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="object"]')!,
       item: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="item"]')!,
-      paint: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="paint"]')!,
     };
     this.panels = {
       npc: this.root.querySelector<HTMLDivElement>(".panel-npc")!,
       object: this.root.querySelector<HTMLDivElement>(".panel-object")!,
       item: this.root.querySelector<HTMLDivElement>(".panel-item")!,
-      paint: this.root.querySelector<HTMLDivElement>(".panel-paint")!,
     };
     this.resultsEls = {
       npc: this.panels.npc.querySelector<HTMLDivElement>(".results")!,
@@ -280,10 +256,7 @@ export class ToolPanel {
       npc: this.panels.npc.querySelector<HTMLDivElement>(".armed")!,
       object: this.panels.object.querySelector<HTMLDivElement>(".armed")!,
       item: this.panels.item.querySelector<HTMLDivElement>(".armed")!,
-      paint: this.panels.paint.querySelector<HTMLDivElement>(".armed")!,
     };
-    this.paintColorInput = this.panels.paint.querySelector<HTMLInputElement>('input[type="color"]')!;
-    this.paintToggle = this.panels.paint.querySelector<HTMLButtonElement>(".paint-toggle")!;
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
 
@@ -292,7 +265,7 @@ export class ToolPanel {
   }
 
   private wireEvents(): void {
-    for (const tab of ["npc", "object", "item", "paint"] as const) {
+    for (const tab of ["npc", "object", "item"] as const) {
       this.tabBtns[tab].addEventListener("click", () => this.setTab(tab));
     }
     this.root
@@ -314,16 +287,11 @@ export class ToolPanel {
       });
     }
 
-    this.paintColorInput.addEventListener("input", () =>
-      this.host.onPaintColor(this.paintColorInput.value),
-    );
-    this.paintToggle.addEventListener("click", () => this.togglePaintArmed());
-
     this.root
       .querySelectorAll<HTMLButtonElement>("button.action[data-clear]")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
-          const target = btn.dataset.clear as "npc" | "object" | "paint" | "all";
+          const target = btn.dataset.clear as ModelTab | "all";
           this.host.onClear(target);
         });
       });
@@ -370,7 +338,7 @@ export class ToolPanel {
     }
   }
 
-  private setTab(tab: ToolTab): void {
+  private setTab(tab: ModelTab): void {
     this.activeTab = tab;
     for (const [k, btn] of Object.entries(this.tabBtns)) {
       btn.classList.toggle("active", k === tab);
@@ -385,9 +353,8 @@ export class ToolPanel {
     if (tab === "item" && !this.tabStates.item.catalog) {
       void this.loadCatalog("item");
     }
-    // Switching tabs also cancels whatever was armed on the previous one —
-    // prevents confusing "I'm on the Paint tab but my clicks still place
-    // NPCs" states.
+    // Switching tabs cancels whatever was armed on the previous one —
+    // prevents "I'm on Items but my clicks still place NPCs" confusion.
     this.cancelArmed();
   }
 
@@ -438,8 +405,7 @@ export class ToolPanel {
   }
 
   private armEntry(tab: ModelTab, entry: NamedEntry): void {
-    // Cancel paint and the other tab's armed entry — only one armed
-    // thing at a time across the whole editor.
+    // Cancel any other armed tab — only one armed thing at a time.
     this.cancelArmed();
     this.tabStates[tab].armedId = entry.id;
     this.host.onArmEntity(tab, entry);
@@ -456,31 +422,8 @@ export class ToolPanel {
     this.renderResults(tab);
   }
 
-  private togglePaintArmed(): void {
-    if (this.paintArmed) {
-      this.cancelArmed();
-      return;
-    }
-    // Cancel any other tool before arming paint.
-    this.cancelArmed();
-    this.paintArmed = true;
-    this.host.onPaintArm(true);
-    this.paintToggle.textContent = "disarm paint mode";
-    const banner = this.armedBanners.paint;
-    banner.style.display = "flex";
-    banner.innerHTML = `
-      <span>painting with <b>${escapeHtml(this.paintColorInput.value)}</b></span>
-      <button type="button">cancel</button>
-    `;
-    (banner.querySelector("button") as HTMLButtonElement).addEventListener(
-      "click",
-      () => this.cancelArmed(),
-    );
-  }
-
   /** Called by the host when a placement succeeds and place-mode should
-   *  end. We deliberately keep paint mode latched — the user is likely
-   *  painting many tiles. Model placers clear on first place. */
+   *  end. */
   onPlacedModel(): void {
     this.cancelArmed();
   }
@@ -495,12 +438,6 @@ export class ToolPanel {
         this.armedBanners[tab].style.display = "none";
         this.armedBanners[tab].innerHTML = "";
       }
-    }
-    if (this.paintArmed) {
-      this.paintArmed = false;
-      this.paintToggle.textContent = "arm paint mode";
-      this.armedBanners.paint.style.display = "none";
-      this.armedBanners.paint.innerHTML = "";
     }
     this.host.onCancel();
     this.renderResults("npc");

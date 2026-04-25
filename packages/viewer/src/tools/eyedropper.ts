@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import type { LocsManifest } from "@rsmap/shared";
+import type { PlacedMeshUserData } from "./placerTypes.js";
 
 /**
  * "Pick from world" tool. Click on anything in the scene while armed and
@@ -13,9 +14,8 @@ import type { LocsManifest } from "@rsmap/shared";
  *     `{ kind: "npc" | "object", id }`. These carry `userData.kind` / `id`
  *     set by ModelPlacer.
  *
- * Painted tiles and terrain triangles return `null` — picking colors from
- * the terrain is a separate feature (if we add it, it'd feed the paint
- * color input, not the entity picker).
+ * Terrain triangles return `null` — eyedropping bare ground is intentionally
+ * a miss, not "the first scenery hidden behind it".
  *
  * Host wiring:
  *   - Construct once, call `addRegion` as regions stream in (mirrors the
@@ -131,7 +131,7 @@ export class Eyedropper {
       const obj = hit.object;
       // Ghost meshes carry no kind/id; ModelPlacer names them `<kind>:ghost`.
       if (obj.name.endsWith(":ghost")) continue;
-      const ud = obj.userData as { kind?: string; id?: number; name?: string };
+      const ud = obj.userData as Partial<PlacedMeshUserData>;
 
       // User-placed mesh: kind + id live directly on the mesh.
       if ((ud.kind === "npc" || ud.kind === "object") && typeof ud.id === "number") {

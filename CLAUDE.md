@@ -164,13 +164,38 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
   default sRGB-to-linear-to-sRGB pipeline would double-encode and produce
   a yellow cast. Atlas texture colorSpace is `NoColorSpace`.
 
+## In-viewer editor
+
+Top-right tool panel with three placement tabs (NPCs / Objects / Items) plus
+an Eyedropper to grab an entity id from anything in the world. Each tab fetches
+a baked geometry on-demand via Vite dev middleware, ghosts a preview at the
+cursor, and drops a `THREE.Mesh` on click. Animations, contoured-ground
+deformation, and 45° rotation steps all carry from the placer's behaviour.
+See `memory/editor_tools.md` for the full rundown.
+
+Selection layer (no tool armed → click-to-select an existing placement):
+
+- `OutlinePass` highlights the selected mesh in cyan.
+- `TransformControls` gizmo: `T` for translate (XZ ground-plane only — Y
+  re-clamps to terrain on every drag), `R` for rotate around Y. Snaps to 45°,
+  hold Shift for free angle.
+- Floating inspector panel: numeric X/Z/rotation, ±45° steppers, NPC
+  animation override, Delete + Duplicate.
+- Keyboard: Esc deselect, Delete/Backspace remove, Cmd/Ctrl+D duplicate,
+  arrow keys nudge by `TILE_SIZE` (Shift+arrow for 1-unit fine).
+- Arming any placer auto-deselects (the gizmo and a placement ghost can't
+  cohabit the canvas without confusing the click target).
+
+The editor is session-only — placements live in scene memory, no persistence.
+
 ## Debug inspector
 
-Hold **Shift** while hovering the viewer → a panel appears with the cache
-data for the tile / loc under the cursor (plane, tile coords, underlay/overlay
-ids + textureIds, raw RGB, blended HSL, loc type + rotation, face counts, etc).
-**Shift+click** copies a compact paste-ready block to the clipboard — the
-preferred way to report visual bugs.
+Hold **Shift** while hovering the viewer (with no editor tool armed and
+nothing selected) → a panel appears with the cache data for the tile / loc
+under the cursor (plane, tile coords, underlay/overlay ids + textureIds, raw
+RGB, blended HSL, loc type + rotation, face counts, etc). **Shift+click**
+copies a compact paste-ready block to the clipboard — the preferred way to
+report visual bugs.
 
 Implementation: `packages/viewer/src/debug/inspector.ts`. Debug data lives in
 `terrain.debug.json`, `terrain.tri_tiles.bin`, and `locs.debug.json`; all are
@@ -190,6 +215,11 @@ lazy-loaded on first Shift press so normal rendering has zero cost.
 | `packages/viewer/src/main.ts` | Three.js scene + camera + lights |
 | `packages/viewer/src/terrain/buildTerrainMesh.ts` | BufferGeometry per plane |
 | `packages/viewer/src/locs/placeLocs.ts` | InstancedMesh per (locId, type) |
+| `packages/viewer/src/tools/modelPlacer.ts` | NPC / Object / Item placer (implements `Placer`) |
+| `packages/viewer/src/tools/selection.ts` | Click-to-select, OutlinePass, TransformControls |
+| `packages/viewer/src/tools/inspectorPanel.ts` | Floating draggable inspector |
+| `packages/viewer/src/tools/placerTypes.ts` | `Placer` interface, `PlacedRef`, `PlacedMeshUserData` |
+| `packages/extractor/scripts/reextract-all.ts` | Bulk re-extract every region (atlas-poisoning fix) |
 | `shared/src/region-bundle.ts` | shared on-disk schema types |
 
 ## Commit / release hygiene
