@@ -39,6 +39,8 @@ export interface ToolPanelHost {
    *  tile centers (the default); `true` drops the snap and lets users
    *  place anywhere the cursor lands. */
   onSnapToTileToggle(snap: boolean): void;
+  /** User clicked the screenshot button (or pressed P). */
+  onScreenshot(): void;
 }
 
 type AnyCatalog = NpcCatalogEntry[] | ObjectCatalogEntry[] | ItemCatalogEntry[];
@@ -187,6 +189,9 @@ export class ToolPanel {
           <button class="head-btn eyedropper" type="button" title="pick from world (I)">
             pick
           </button>
+          <button class="head-btn screenshot" type="button" title="screenshot (P)">
+            snap
+          </button>
           <button class="collapse" type="button" title="collapse">–</button>
         </div>
       </div>
@@ -259,6 +264,9 @@ export class ToolPanel {
     };
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
+    this.root
+      .querySelector<HTMLButtonElement>(".screenshot")!
+      .addEventListener("click", () => this.host.onScreenshot());
 
     this.wireEvents();
     void this.loadCatalog("npc");

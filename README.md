@@ -9,8 +9,12 @@ the rendered world there's an in-browser editor for arranging scenes —
 placing NPCs, objects, and items, selecting and manipulating them with a 3D
 gizmo, all session-only (no persistence yet).
 
-Not affiliated with Jagex. Educational/research project that reads public
-cache snapshots; OSRS cache data is © Jagex Ltd.
+Educational/research project that reads public cache snapshots.
+
+![Falador at dawn with fog](docs/screenshots/falador-dawn.png)
+![NPC placement with the editor gizmo](docs/screenshots/editor-npc-gizmo.png)
+![Building a custom scene with objects](docs/screenshots/editor-objects.png)
+![Closeup of the same scene](docs/screenshots/scene-closeup.png)
 
 [Quick start](#quick-start) · [Editor controls](#editor-controls) ·
 [Architecture](#architecture) · [Limitations](#limitations) ·
@@ -171,6 +175,26 @@ These are intentional scope cuts, not bugs:
 A fuller list lives in [`CLAUDE.md`](CLAUDE.md) under *Known M1
 limitations*.
 
+## Known issues
+
+These are bugs (not intentional cuts) and are likely to bite if you wander
+the world:
+
+- **Texture artefacts on some tiled loc faces** — castle walls, tall
+  stone surfaces, and similar repeated-texture geometry can show smeared
+  edge texels. Root cause: OSRS UVs routinely fall outside `[0, 1]` (the
+  client's rasterizer tiles via bitmask wrap) and our atlas-with-clamp
+  pipeline can't represent that. The canonical fix is a per-texture
+  `sampler2DArray` with `GL_REPEAT`; planned but not landed.
+- **Z-fighting between coplanar loc geometry** — adjacent walls / decals
+  / floor stamps occasionally flicker during camera motion. Polygon
+  offset on the loc material mitigates loc-vs-terrain flicker but not
+  loc-vs-loc.
+- **Multi-region terrain seams past the 3×3 grid.** Default
+  `NEIGHBOR_RADIUS = 1` looks clean; bumping it to 2+ exposes visible
+  seams where per-region underlay blending and vertex lighting don't
+  reach into the second-ring neighbours.
+
 ---
 
 ## Build a static site
@@ -220,5 +244,5 @@ pnpm build
 
 ## License
 
-MIT for everything in this repository. OSRS cache data is © Jagex
-Ltd. — you are responsible for the terms under which you access it.
+MIT for everything in this repository. You are responsible for the
+terms under which you access OSRS cache data.

@@ -19,6 +19,8 @@ import { Eyedropper } from "./tools/eyedropper.js";
 import { Selection } from "./tools/selection.js";
 import { InspectorPanel } from "./tools/inspectorPanel.js";
 import { loadGlobalAtlas } from "./tools/globalAtlas.js";
+import { captureScreenshot } from "./util/screenshot.js";
+import { PlacesPanel } from "./ui/placesPanel.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
 // gamma/linear-space conversions. With Three's default color management on,
@@ -273,6 +275,30 @@ async function main(): Promise<void> {
     { sky: INITIAL_SKY },
   );
 
+  /**
+   * Snap the camera to the world-space center of a given region. Existing
+   * regions stay in the scene; the streaming loader picks up the new
+   * camera position and pulls neighbours of the destination on demand.
+   * Camera pose mirrors the initial setup (high + slightly south, looking
+   * at the center) so the framing stays consistent across teleports.
+   */
+  const goToRegion = (targetRegionId: number): void => {
+    const { regionX: trx, regionZ: trz } = unpackRegionId(targetRegionId);
+    const dx = trx - centerRegionX;
+    const dz = trz - centerRegionZ;
+    const worldX = (dx + 0.5) * REGION_SPAN;
+    // Cache +Z=north → world −Z=north, so dz>0 (north of center) sits at
+    // world Z < 0. Match the same offset math as `setupRegion`.
+    const worldZ = -(dz + 0.5) * REGION_SPAN;
+    camera.position.set(worldX, TILE_SIZE * 30, worldZ + TILE_SIZE * 40);
+    controls.target.set(worldX, 0, worldZ);
+    controls.update();
+  };
+
+  new PlacesPanel({
+    onTeleport: (regionId) => goToRegion(regionId),
+  });
+
   // Plane cap — OSRS roof-removal. Default 1: ground + bridges visible,
   // upper stories + roofs hidden. Applied uniformly across every loaded
   // region. `[` goes down a floor, `]` goes up. Cumulative: cap=3 shows all.
@@ -330,8 +356,16 @@ async function main(): Promise<void> {
       applyPlaneCap();
     } else if (e.key === "h" || e.key === "H") {
       document.body.classList.toggle("ui-hidden");
+    } else if (e.key === "p" || e.key === "P") {
+      takeScreenshot();
     }
   });
+
+  /** Flushes a render and downloads the canvas as PNG. Re-named here so
+   *  both the keybind and the toolpanel button share the same path. */
+  const takeScreenshot = (): void => {
+    captureScreenshot(renderer, scene, camera, CENTER_REGION_ID);
+  };
 
   // WASD pan — unchanged from the single-region build. Speed scales with
   // camera height so the Google-Maps feel carries into the larger grid.
@@ -536,6 +570,7 @@ async function main(): Promise<void> {
       // construction, so we leave it alone.
       forEachModelPlacer((p) => p.setSnapToTile(snap));
     },
+    onScreenshot: () => takeScreenshot(),
   });
 
   // Panel renders the animation-picker once an NPC's bake resolves and
