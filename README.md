@@ -19,6 +19,7 @@ project reading public cache snapshots.
 
 ## Use it for
 
+- **Learning** — a hands-on tour of Three.js, WebGL, and the OSRS cache decode pipeline; this is primarily a learning project
 - **YouTube intros + cutaways** — frame a hero shot of any city for your next video
 - **Custom thumbnails** — stage the exact moment you want without wrestling the in-game camera
 - **Fan-fic / quest storyboards** — block out scenes before drawing or writing
