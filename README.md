@@ -22,9 +22,6 @@ project reading public cache snapshots.
 - **YouTube intros + cutaways** — frame a hero shot of any city for your next video
 - **Custom thumbnails** — stage the exact moment you want without wrestling the in-game camera
 - **Fan-fic / quest storyboards** — block out scenes before drawing or writing
-- **Wallpapers** — Falador at dawn, Lumbridge under the aurora, Catherby at sunset…
-- **Meme dioramas** — kraken vs. cannon armada at Lumbridge harbour, dragons on the bridge
-- **"What-if" scenes** — fill Varrock Square with chickens, drop a King Black Dragon in the Grand Exchange
 
 ![Falador at dawn with fog](docs/screenshots/falador-dawn.png)
 ![NPC placement with the editor gizmo](docs/screenshots/editor-npc-gizmo.png)
