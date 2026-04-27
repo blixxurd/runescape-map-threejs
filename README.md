@@ -1,15 +1,30 @@
-# RuneScape Map — Three.js
+# ScapeStudio
 
-> A browser-based map viewer and scene editor for Old School RuneScape.
+> A Three.JS RuneScape Map Loader and Scene Editor
 
-Decodes snapshots of the OSRS cache from the
-[openrs2 archive](https://archive.openrs2.org/) into static, Three.js-ready
-region bundles, then renders them with a Vite + Three.js frontend. On top of
-the rendered world there's an in-browser editor for arranging scenes —
-placing NPCs, objects, and items, selecting and manipulating them with a 3D
-gizmo, all session-only (no persistence yet).
+A 3D scene editor for Old School RuneScape that runs in the browser.
+Stream regions of the live cache, drop in NPCs / objects / items / paint,
+and frame the shot with a built-in screenshot tool. Educational/research
+project reading public cache snapshots.
 
-Educational/research project that reads public cache snapshots.
+## Features
+
+- **Stream the whole world** — load any region by URL, neighbours pop in as you pan
+- **Place anything from the cache** — 12k+ NPCs, 27k+ objects, every item
+- **3D gizmo** — translate, rotate, free-angle, multi-select; tile-snap or free placement
+- **Animated NPCs** — standing animations bake into placements; pick alternates per-NPC
+- **Skybox presets + adjustable fog** — Aurora Night, Clear Night, Dawn, Overcast
+- **One-click teleport list** to Lumbridge, Varrock, Falador, Camelot, Yanille…
+- **Built-in screenshot** (`P`) and **hide-all-UI** (`H`) for clean shots
+
+## Use it for
+
+- **YouTube intros + cutaways** — frame a hero shot of any city for your next video
+- **Custom thumbnails** — stage the exact moment you want without wrestling the in-game camera
+- **Fan-fic / quest storyboards** — block out scenes before drawing or writing
+- **Wallpapers** — Falador at dawn, Lumbridge under the aurora, Catherby at sunset…
+- **Meme dioramas** — kraken vs. cannon armada at Lumbridge harbour, dragons on the bridge
+- **"What-if" scenes** — fill Varrock Square with chickens, drop a King Black Dragon in the Grand Exchange
 
 ![Falador at dawn with fog](docs/screenshots/falador-dawn.png)
 ![NPC placement with the editor gizmo](docs/screenshots/editor-npc-gizmo.png)
