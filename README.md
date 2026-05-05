@@ -73,6 +73,17 @@ extractor bug fix that requires regenerating bundles):
 pnpm --filter @rsmap/extractor exec tsx scripts/reextract-all.ts
 ```
 
+For static deploys (`pnpm build`), bake the entity catalogs into static JSON
+so the editor pickers work without the dev middleware:
+
+```bash
+pnpm catalogs   # writes packages/viewer/public/catalog/*.json
+```
+
+Schema-version-bumped bundles auto-rebuild on first visit in dev (the
+viewer's loader catches a mismatch and re-runs extraction); production
+deploys throw a clean "rerun pnpm extract" error instead.
+
 ---
 
 ## What works
@@ -101,9 +112,10 @@ selected entity.
 
 | Tool | What it does |
 |---|---|
-| **NPCs** | Search ~12k NPCs, click to arm, click terrain to place. Idle animations auto-loop. NPC's declared animations are in a per-arm dropdown; "more animations ▾" searches the full ~12k sequence catalog. |
+| **NPCs** | Search ~12k NPCs, click to arm, click terrain to place. Idle animations auto-loop. NPC's declared animations are in a per-arm dropdown (now incl. run + crawl rotation variants); "more animations ▾" searches the full ~12k sequence catalog. |
 | **Objects** | Search ~28k baked locs (walls, scenery, doors, crates). `R` rotates in 45° steps; contoured objects follow terrain slopes; animated ones (mills, fires, banners) cycle frames. |
 | **Items** | Search ~5k items; drops the inventory model on the ground at click position. |
+| **FX** | ~3.5k SpotAnims — projectiles, spell impacts, gfx-on-NPC. Force-looped while placed in the editor so you can actually see the animation; in-game these are one-shot effects. |
 | **Eyedropper (`I`)** | Click any baked loc in the world to grab its id and re-arm the Object tool. |
 | **Free placement** | Toggle in panel head — disables tile-center snap for off-grid positioning. |
 
@@ -177,7 +189,15 @@ These are intentional scope cuts, not bugs:
   client's auto-roof-removal is not implemented.
 - **No water / water animation** and most dynamic effects.
 - **Per-instance animation phase not randomized** — neighbouring identical
-  animated locs move in sync.
+  animated locs move in sync. The cache flag (`randomizeAnimStart`) is now
+  captured in the bundle, but the runtime per-instance phase split isn't
+  wired yet (no on-disk region exercises it; details in
+  [`memory/animation_wip.md`](docs/extraction-roadmap.md)).
+- **No reactive varbit/varp UI.** Phase 5 captured the morph data
+  (configChangeDest, controlling var) and the viewer resolves alternates
+  at scene-load time via `varState.ts`. Flipping vars requires a reload;
+  the live UI is parked as Phase 5b in
+  [`docs/extraction-roadmap.md`](docs/extraction-roadmap.md).
 - **No streaming / LOD** for whole-world rendering.
   See [`docs/scaling.md`](docs/scaling.md) for the plan.
 - **Editor is session-only** — placements don't persist across reloads.
@@ -186,7 +206,9 @@ These are intentional scope cuts, not bugs:
   mismatched skeletons will render oddly.
 
 A fuller list lives in [`CLAUDE.md`](CLAUDE.md) under *Known M1
-limitations*.
+limitations*; phases parked for future work (audio, minimap, player
+avatars, music) are documented in
+[`docs/extraction-roadmap.md`](docs/extraction-roadmap.md).
 
 ## Known issues
 
@@ -237,6 +259,8 @@ Worth reading next:
   cuts.
 - [`docs/scaling.md`](docs/scaling.md) — plan for rendering past a 3×3
   grid.
+- [`docs/extraction-roadmap.md`](docs/extraction-roadmap.md) — phases of
+  cache extraction we've parked (audio, minimap, player/equipment).
 
 ---
 

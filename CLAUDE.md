@@ -15,9 +15,12 @@ packages/extractor/   Node CLI — decodes one region → static bundle
           ▼
 packages/viewer/public/regions/<id>/
   terrain.meta.json  + terrain.pos.bin + terrain.col.bin + terrain.uv.bin
-                     + terrain.heights.bin
+                     + terrain.heights.bin + terrain.blocked.bin
   locs.json          + locs.pos.bin    + locs.col.bin    + locs.uv.bin
+                     + locs.frames.pos.bin (when any animated)
   atlas.json         + atlas.png       (shared for both)
+packages/viewer/public/catalog/      (gitignored, baked by `pnpm catalogs`)
+  npc.json + object.json + item.json + spotanim.json + sequence.json
           │
           ▼
 packages/viewer/     Vite + Three.js app — fetches bundle, builds BufferGeometry
@@ -26,7 +29,11 @@ packages/viewer/     Vite + Three.js app — fetches bundle, builds BufferGeomet
 
 Extractor runs offline (Node); viewer only reads static files. The on-disk
 schema is declared once in `shared/src/region-bundle.ts` and imported by both
-packages.
+packages. Each artifact carries a `schemaVersion` field gated against a
+single-source `*_SCHEMA` constant in that same file — the loader raises
+`StaleBundleError` on mismatch, which auto-triggers a re-extract in dev
+(via the `/api/extract` middleware) and throws cleanly in static deploys.
+See `memory/bundle_schema_versioning.md` for the bump procedure.
 
 ## Run
 
@@ -34,11 +41,15 @@ packages.
 pnpm install
 pnpm extract -- --region 12850      # Lumbridge on the pinned build
 pnpm extract -- --region 12850 --build 230   # override if experimenting
+pnpm catalogs                       # bake static entity catalogs (NPC/object/item/spotanim/sequence)
 pnpm dev                            # viewer at http://127.0.0.1:5173/?region=12850
 pnpm typecheck                      # both packages
 ```
 
 `.cache/` is gitignored; first extract downloads ~140 MB of cache + keys.
+`packages/viewer/public/catalog/` is gitignored too — `pnpm catalogs` is
+only required for static deploys (`pnpm build`); dev mode falls back to
+the live `/api/<name>-catalog` endpoints.
 
 ### Cache build pin
 
@@ -131,7 +142,10 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
   needs a player-position feature we haven't built. The raw byte is
   preserved through the debug JSON so the inspector surfaces it; see
   `reference/AUDIT.md` → *Tile* and `memory/tile_settings_byte.md` for the
-  exhaustive per-bit writeup.
+  exhaustive per-bit writeup. **Bit `0x1` (gameplay-blocked)** *is* now
+  extracted: 1 byte per tile in `terrain.blocked.bin`, plane-major.
+  Consumers (passability overlays, pathfinding) can read it directly off
+  the bundle.
 - **Contoured-ground scenery follows the slope.** Trees / fences / rocks
   (`ObjectDefinition.contouredGround`, opcodes 21 & 81) get per-vertex Y
   deformation baked into a per-placement copy of the block geometry. Trunk
@@ -151,7 +165,9 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
   Diagonal-wall (`bakedRotation ≥ 4`) animated locs fall back to the static
   pose. All instances of a block animate in lockstep — `randomizeAnimStart`
   (per-instance random phase) is not implemented, so neighbouring identical
-  animated locs move in sync.
+  animated locs move in sync. The cache flag is now captured in the bundle
+  (`LocBlockAnimation.randomizePhase`) so a future runtime split has the
+  input it needs; see `memory/animation_wip.md` for the deferred plan.
 - **Terrain and loc lighting are both pre-baked** into per-vertex colors
   using the OSRS client's exact algorithms (`Landscape.mixLightness` for
   terrain, `Model.applyLighting` + `method816` for locs). Both meshes
@@ -166,12 +182,15 @@ These are intentional scope cuts, not bugs — tackle them only when promoted:
 
 ## In-viewer editor
 
-Top-right tool panel with three placement tabs (NPCs / Objects / Items) plus
-an Eyedropper to grab an entity id from anything in the world. Each tab fetches
-a baked geometry on-demand via Vite dev middleware, ghosts a preview at the
-cursor, and drops a `THREE.Mesh` on click. Animations, contoured-ground
-deformation, and 45° rotation steps all carry from the placer's behaviour.
-See `memory/editor_tools.md` for the full rundown.
+Top-right tool panel with four placement tabs (NPCs / Objects / Items / FX)
+plus an Eyedropper to grab an entity id from anything in the world. Each
+tab fetches a baked geometry on-demand via Vite dev middleware, ghosts a
+preview at the cursor, and drops a `THREE.Mesh` on click. Animations,
+contoured-ground deformation, and 45° rotation steps all carry from the
+placer's behaviour. The FX tab places SpotAnims (projectiles, spell
+impacts, gfx-on-NPC); cache `frameStep === -1` is force-promoted to a
+full loop so the editor can show the animation continuously. See
+`memory/editor_tools.md` for the full rundown.
 
 Selection layer (no tool armed → click-to-select an existing placement):
 
@@ -215,14 +234,18 @@ lazy-loaded on first Shift press so normal rendering has zero cost.
 | `packages/viewer/src/main.ts` | Three.js scene + camera + lights |
 | `packages/viewer/src/terrain/buildTerrainMesh.ts` | BufferGeometry per plane |
 | `packages/viewer/src/locs/placeLocs.ts` | InstancedMesh per (locId, type) |
-| `packages/viewer/src/tools/modelPlacer.ts` | NPC / Object / Item placer (implements `Placer`) |
+| `packages/viewer/src/tools/modelPlacer.ts` | NPC / Object / Item / SpotAnim placer (implements `Placer`) |
 | `packages/viewer/src/tools/selection.ts` | Click-to-select, OutlinePass, TransformControls |
 | `packages/viewer/src/tools/inspectorPanel.ts` | Floating draggable inspector |
 | `packages/viewer/src/tools/placerTypes.ts` | `Placer` interface, `PlacedRef`, `PlacedMeshUserData` |
+| `packages/viewer/src/state/varState.ts` | Phase 5 varbit/varp registry; consulted at scene-load to resolve loc morphs |
+| `packages/extractor/src/entities/spotAnimModel.ts` | Phase 9 SpotAnim baker + catalog |
 | `packages/extractor/scripts/reextract-all.ts` | Bulk re-extract every region (atlas-poisoning fix) |
-| `shared/src/region-bundle.ts` | shared on-disk schema types |
+| `shared/src/region-bundle.ts` | shared on-disk schema types + `*_SCHEMA` constants |
+| `docs/extraction-roadmap.md` | parked phases (audio / minimap / player / music / reactive var UI) |
 
 ## Commit / release hygiene
 
 - `packages/viewer/public/regions/` is gitignored (regenerate via `pnpm extract`).
+- `packages/viewer/public/catalog/` is gitignored (regenerate via `pnpm catalogs`).
 - `.cache/` is gitignored.
