@@ -184,6 +184,13 @@ export interface ObjectCatalogEntry {
   modelType: number;
   sizeX: number;
   sizeY: number;
+  /** Phase 4 picker metadata. */
+  category?: number;
+  interactType?: number;
+  /** Cache opcode 249 free-form key/value bag (teleport destinations,
+   *  varbit thresholds, etc). Always raw — caller interprets. Elided
+   *  when the cache opcode didn't fire. */
+  params?: Record<string, string | number>;
 }
 
 /**
@@ -202,13 +209,23 @@ export async function buildObjectCatalog(rs: RSCache): Promise<ObjectCatalogEntr
     const hasDefinedTypes = d.objectTypes && d.objectTypes.length > 0;
     const hasDefaultModels = d.objectModels && d.objectModels.length > 0;
     if (!hasDefinedTypes && !hasDefaultModels) continue;
-    out.push({
+    const entry: ObjectCatalogEntry = {
       id: d.id,
       name: d.name,
       modelType: hasDefinedTypes ? d.objectTypes![0]! : 10,
       sizeX: d.sizeX ?? 1,
       sizeY: d.sizeY ?? 1,
-    });
+    };
+    if (d.category !== undefined) entry.category = d.category;
+    // Default 2 (blocks player+projectiles); only persist deviations to
+    // keep the catalog JSON small.
+    if (d.interactType !== undefined && d.interactType !== 2) {
+      entry.interactType = d.interactType;
+    }
+    if (d.params && Object.keys(d.params).length > 0) {
+      entry.params = { ...d.params };
+    }
+    out.push(entry);
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;

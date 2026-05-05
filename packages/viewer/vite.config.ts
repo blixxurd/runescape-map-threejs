@@ -11,12 +11,15 @@ import type {
   buildObjectCatalog as BuildObjectCatalogFn,
   bakeItem as BakeItemFn,
   buildItemCatalog as BuildItemCatalogFn,
+  bakeSpotAnim as BakeSpotAnimFn,
+  buildSpotAnimCatalog as BuildSpotAnimCatalogFn,
   buildSequenceCatalog as BuildSequenceCatalogFn,
   buildGlobalAtlas as BuildGlobalAtlasFn,
   BakedAtlas,
   NpcCatalogEntry,
   ObjectCatalogEntry,
   ItemCatalogEntry,
+  SpotAnimCatalogEntry,
   SequenceCatalogEntry,
 } from "@rsmap/extractor";
 import { defineConfig } from "vite";
@@ -47,6 +50,8 @@ function autoExtractPlugin(): Plugin {
     buildObjectCatalog: typeof BuildObjectCatalogFn;
     bakeItem: typeof BakeItemFn;
     buildItemCatalog: typeof BuildItemCatalogFn;
+    bakeSpotAnim: typeof BakeSpotAnimFn;
+    buildSpotAnimCatalog: typeof BuildSpotAnimCatalogFn;
     buildSequenceCatalog: typeof BuildSequenceCatalogFn;
     buildGlobalAtlas: typeof BuildGlobalAtlasFn;
   }
@@ -64,6 +69,7 @@ function autoExtractPlugin(): Plugin {
   let npcCatalogPromise: Promise<NpcCatalogEntry[]> | null = null;
   let objectCatalogPromise: Promise<ObjectCatalogEntry[]> | null = null;
   let itemCatalogPromise: Promise<ItemCatalogEntry[]> | null = null;
+  let spotAnimCatalogPromise: Promise<SpotAnimCatalogEntry[]> | null = null;
   let sequenceCatalogPromise: Promise<SequenceCatalogEntry[]> | null = null;
   // Per-id bake caches — tiny JSON payloads, dedupe rapid re-clicks.
   // Key is `${npcId}:${animationOverrideOrDefault}` so switching animations
@@ -72,6 +78,7 @@ function autoExtractPlugin(): Plugin {
   const npcCache = new Map<string, Promise<unknown>>();
   const objectCache = new Map<number, Promise<unknown>>();
   const itemCache = new Map<number, Promise<unknown>>();
+  const spotAnimCache = new Map<number, Promise<unknown>>();
   // Cache-wide texture atlas shared by every bake. Built on first need —
   // typically triggered by the viewer's atlas pre-load, but the bake path
   // will request it too if the viewer hasn't yet.
@@ -175,6 +182,21 @@ function autoExtractPlugin(): Plugin {
       itemCatalogPromise = null;
     });
     return itemCatalogPromise;
+  }
+
+  async function getSpotAnimCatalog(
+    server: ViteDevServer,
+  ): Promise<SpotAnimCatalogEntry[]> {
+    if (spotAnimCatalogPromise) return spotAnimCatalogPromise;
+    spotAnimCatalogPromise = (async (): Promise<SpotAnimCatalogEntry[]> => {
+      const mod = await loadModule(server);
+      const session = await getSession(server);
+      return mod.buildSpotAnimCatalog(session.rs);
+    })();
+    spotAnimCatalogPromise.catch(() => {
+      spotAnimCatalogPromise = null;
+    });
+    return spotAnimCatalogPromise;
   }
 
   async function getSequenceCatalog(
@@ -306,6 +328,37 @@ function autoExtractPlugin(): Plugin {
     );
   }
 
+  async function getBakedSpotAnim(
+    server: ViteDevServer,
+    spotAnimId: number,
+  ): Promise<unknown> {
+    const atlas = await getGlobalAtlas(server);
+    return bakeEntity(
+      server,
+      spotAnimCache,
+      spotAnimId,
+      (mod, session) => mod.bakeSpotAnim(session.rs, spotAnimId, atlas),
+      (b) => ({
+        id: b.id,
+        name: b.name,
+        scale: b.scale,
+        rotation: b.rotation,
+        animation: b.animation
+          ? {
+              frameCount: b.animation.frameCount,
+              frameTicks: b.animation.frameTicks,
+              framesPositions: Array.from(b.animation.framesPositions),
+              frameStep: b.animation.frameStep,
+            }
+          : undefined,
+        positions: Array.from(b.positions),
+        colors: Array.from(b.colors),
+        uvs: Array.from(b.uvs),
+        bbox: b.bbox,
+      }),
+    );
+  }
+
   return {
     name: "rsmap:auto-extract",
     apply: "serve",
@@ -353,9 +406,11 @@ function autoExtractPlugin(): Plugin {
           npcCache.clear();
           objectCache.clear();
           itemCache.clear();
+          spotAnimCache.clear();
           npcCatalogPromise = null;
           objectCatalogPromise = null;
           itemCatalogPromise = null;
+          spotAnimCatalogPromise = null;
           sequenceCatalogPromise = null;
           extractorModule = null;
           writeJson(res, 200, { ok: true });
@@ -527,6 +582,48 @@ function autoExtractPlugin(): Plugin {
               server.config.logger.error(`[item] ${itemId} failed: ${msg}`);
             }
             writeJson(res, status, { error: msg, itemId });
+          }
+          return;
+        }
+
+        if (
+          req.url === "/api/spotanim-catalog" ||
+          req.url.startsWith("/api/spotanim-catalog?")
+        ) {
+          try {
+            const catalog = await getSpotAnimCatalog(server);
+            writeJson(res, 200, { entries: catalog });
+          } catch (err) {
+            server.config.logger.error(
+              `[spotanim-catalog] failed: ${(err as Error).message}`,
+            );
+            writeJson(res, 500, { error: (err as Error).message });
+          }
+          return;
+        }
+
+        if (req.url.startsWith("/api/spotanim/")) {
+          const match = /^\/api\/spotanim\/(\d+)\/?$/.exec(req.url);
+          if (!match) {
+            writeJson(res, 400, { error: "expected /api/spotanim/<spotAnimId>" });
+            return;
+          }
+          const spotAnimId = Number(match[1]);
+          if (!Number.isInteger(spotAnimId) || spotAnimId < 0) {
+            writeJson(res, 400, { error: `invalid spotanim id: ${match[1]}` });
+            return;
+          }
+          try {
+            const baked = await getBakedSpotAnim(server, spotAnimId);
+            writeJson(res, 200, baked);
+          } catch (err) {
+            const msg = (err as Error).message;
+            const status =
+              /not in cache|no model|no geometry/i.test(msg) ? 404 : 500;
+            if (status !== 404) {
+              server.config.logger.error(`[spotanim] ${spotAnimId} failed: ${msg}`);
+            }
+            writeJson(res, status, { error: msg, spotAnimId });
           }
           return;
         }

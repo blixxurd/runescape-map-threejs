@@ -4,6 +4,7 @@ dist/
 .DS_Store
 *.log
 packages/viewer/public/regions/
+packages/viewer/public/catalog/
 reference/
 .claude/
 packages/extractor/src/scratch/

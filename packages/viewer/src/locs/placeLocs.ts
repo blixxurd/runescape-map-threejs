@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { LocBlock, LocsManifest, TerrainMeta } from "@rsmap/shared";
 import { TILE_SIZE, VERTICES_PER_SIDE, TILES_PER_SIDE } from "@rsmap/shared";
+import { resolveMorphLoc } from "../state/varState.js";
 
 /**
  * Turn a region's loc manifest into scene-graph meshes. Output is bucketed
@@ -105,13 +106,50 @@ export function placeLocs(
     polygonOffsetUnits: -4,
   });
 
+  // Phase 5 morph resolution. For each placement of a morphing source
+  // loc, look up the active alternate locId from `varState` and remap to
+  // the alternate's block (same modelType, bakedRotation). Contoured
+  // blocks are per-placement uniques in the bundle, so the lookup is
+  // built from non-contoured shared blocks only — that matches what we
+  // bake morph alternates as in the extractor.
+  //
+  // resolvedBlockIdx[placementIdx] === -1 means "hide" (alternate was
+  // -1, e.g. a quest-conditional loc that doesn't render in this state).
+  const blockIndexByKey = new Map<string, number>();
+  for (let i = 0; i < manifest.blocks.length; i++) {
+    const b = manifest.blocks[i]!;
+    if (b.contoured) continue;
+    const key = `${b.locId}:${b.modelType}:${b.bakedRotation}`;
+    if (!blockIndexByKey.has(key)) blockIndexByKey.set(key, i);
+  }
+  const resolvedBlockIdx = new Int32Array(manifest.placements.length);
+  for (let i = 0; i < manifest.placements.length; i++) {
+    const p = manifest.placements[i]!;
+    resolvedBlockIdx[i] = p.blockIndex;
+    const block = manifest.blocks[p.blockIndex];
+    const morph = block ? manifest.morphs?.[block.locId] : undefined;
+    if (!block || !morph) continue;
+    if (block.contoured) continue; // see comment above; alternates not contoured-baked
+    const altLocId = resolveMorphLoc(block.locId, morph);
+    if (altLocId === block.locId) continue;
+    if (altLocId < 0) {
+      resolvedBlockIdx[i] = -1;
+      continue;
+    }
+    const altKey = `${altLocId}:${block.modelType}:${block.bakedRotation}`;
+    const altIdx = blockIndexByKey.get(altKey);
+    if (altIdx !== undefined) resolvedBlockIdx[i] = altIdx;
+  }
+
   // Bucket placements by (block, plane). Each `(block, plane)` cell lists
   // the placement indices that share that geometry on that plane — this is
   // the atomic unit for the "instance vs merge" decision below.
   const perBlockPlane: number[][][] = manifest.blocks.map(() => [[], [], [], []]);
   for (let i = 0; i < manifest.placements.length; i++) {
     const p = manifest.placements[i]!;
-    const planeBuckets = perBlockPlane[p.blockIndex]!;
+    const blockIdx = resolvedBlockIdx[i]!;
+    if (blockIdx < 0) continue; // morph said "hide for this var state"
+    const planeBuckets = perBlockPlane[blockIdx]!;
     if (p.plane >= 0 && p.plane < 4) planeBuckets[p.plane]!.push(i);
   }
 

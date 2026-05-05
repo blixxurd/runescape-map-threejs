@@ -315,7 +315,7 @@ export interface BakedNpcAnimation {
 
 /** Internal helper — also used by objectModel.ts. Exported for composition
  *  only, not intended as part of the public extractor API. */
-export { flattenEntityModel };
+export { flattenEntityModel, fetchModel };
 
 /**
  * Load, merge, light, and flatten one NPC into a render-ready triangle soup.
@@ -323,7 +323,14 @@ export { flattenEntityModel };
  * the cache — the caller (dev middleware) treats that as 404.
  */
 /** Fields on NpcDefinition that reference a sequence id. The label is what
- *  we show to the user in the picker. Order here is the menu order. */
+ *  we show to the user in the picker. Order here is the menu order.
+ *
+ *  Run + crawl rotation variants come straight from the cache opcodes —
+ *  per `osrscachereader/loaders/NpcLoader.js:356-368` (run anims) and
+ *  363-368 (crawl anims). The cache only stores state-machine anims
+ *  (idle / walk / rotate / run / crawl); attack/emote anims live in
+ *  game scripts and aren't reachable from cache (see
+ *  `memory/npc_animation_semantics.md`). */
 const NPC_ANIMATION_FIELDS: Array<{
   key: keyof NpcDefinition;
   label: string;
@@ -331,12 +338,18 @@ const NPC_ANIMATION_FIELDS: Array<{
   { key: "standingAnimation", label: "standing" },
   { key: "walkingAnimation", label: "walking" },
   { key: "runAnimation", label: "running" },
+  { key: "crawlAnimation", label: "crawl" },
+  { key: "rotateLeftAnimation", label: "rotate left" },
+  { key: "rotateRightAnimation", label: "rotate right" },
   { key: "rotate90LeftAnimation", label: "turn left 90°" },
   { key: "rotate90RightAnimation", label: "turn right 90°" },
   { key: "rotate180Animation", label: "turn 180°" },
-  { key: "rotateLeftAnimation", label: "rotate left" },
-  { key: "rotateRightAnimation", label: "rotate right" },
-  { key: "crawlAnimation", label: "crawl" },
+  { key: "runRotateLeftAnimation", label: "run rotate left" },
+  { key: "runRotateRightAnimation", label: "run rotate right" },
+  { key: "runRotate180Animation", label: "run turn 180°" },
+  { key: "crawlRotateLeftAnimation", label: "crawl rotate left" },
+  { key: "crawlRotateRightAnimation", label: "crawl rotate right" },
+  { key: "crawlRotate180Animation", label: "crawl turn 180°" },
 ];
 
 function collectAnimationMenu(def: NpcDefinition): Array<{ id: number; label: string }> {
@@ -459,6 +472,17 @@ export interface NpcCatalogEntry {
   name: string;
   combatLevel: number;
   size: number;
+  /** Phase 4 picker metadata. */
+  category?: number;
+  /** Default true; only persisted when explicitly disabled. */
+  isMinimapVisible?: false;
+  renderPriority?: number;
+  rotationSpeed?: number;
+  /** Length of `headIconArchiveIds` if present (skull/protect-prayer/boss
+   *  icons). The actual archive+index is per-NPC scenery; we surface the
+   *  count so pickers can label "has head icons". Full data fetch via
+   *  `/api/npc/:id` if needed. */
+  headIconCount?: number;
 }
 
 /**
@@ -473,12 +497,22 @@ export async function buildNpcCatalog(rs: RSCache): Promise<NpcCatalogEntry[]> {
     if (!d) continue;
     if (!d.models || d.models.length === 0) continue;
     if (!d.name || d.name.toLowerCase() === "null") continue;
-    out.push({
+    const entry: NpcCatalogEntry = {
       id: d.id,
       name: d.name,
       combatLevel: d.combatLevel ?? -1,
       size: d.size ?? 1,
-    });
+    };
+    if (d.category !== undefined) entry.category = d.category;
+    if (d.isMinimapVisible === false) entry.isMinimapVisible = false;
+    if (d.renderPriority !== undefined && d.renderPriority !== 0 && d.renderPriority !== 1) {
+      entry.renderPriority = d.renderPriority;
+    }
+    if (d.rotationSpeed !== undefined) entry.rotationSpeed = d.rotationSpeed;
+    if (d.headIconArchiveIds && d.headIconArchiveIds.length > 0) {
+      entry.headIconCount = d.headIconArchiveIds.length;
+    }
+    out.push(entry);
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;

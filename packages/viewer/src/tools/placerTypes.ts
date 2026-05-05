@@ -14,7 +14,7 @@ import type * as THREE from "three";
  * each tool individually.
  */
 
-export type PlacerKind = "npc" | "object" | "item";
+export type PlacerKind = "npc" | "object" | "item" | "spotanim";
 
 export interface PlacedMeshUserData {
   kind: PlacerKind;

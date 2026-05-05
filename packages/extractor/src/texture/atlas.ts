@@ -16,6 +16,7 @@ import { IndexType } from "osrscachereader";
 // @ts-ignore - canvas is a transitive dep of osrscachereader, no types package
 import { createCanvas } from "canvas";
 import type { TextureAtlas } from "@rsmap/shared";
+import { TEXTURE_ATLAS_SCHEMA } from "@rsmap/shared";
 
 /** Target cell size; most OSRS ground textures are 128×128. */
 const CELL_SIZE = 128;
@@ -236,7 +237,7 @@ export async function buildAtlas(cache: RSCache, textureIds: Iterable<number>): 
 
   return {
     manifest: {
-      schemaVersion: 1,
+      schemaVersion: TEXTURE_ATLAS_SCHEMA,
       atlasFile: "atlas.png",
       atlasSize,
       cellSize: CELL_SIZE,

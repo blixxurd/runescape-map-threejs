@@ -1,4 +1,31 @@
 import type { TerrainMeta, LocsManifest, TextureAtlas } from "@rsmap/shared";
+import {
+  TERRAIN_META_SCHEMA,
+  LOCS_MANIFEST_SCHEMA,
+  TEXTURE_ATLAS_SCHEMA,
+} from "@rsmap/shared";
+
+/**
+ * Thrown when an on-disk bundle has a different schemaVersion than the
+ * loader expects. In dev the loader catches this and triggers a re-extract;
+ * in static-deploy mode it propagates so the UI can tell the user to rerun
+ * `pnpm extract`. Different artifacts on the same region can mismatch
+ * independently — `artifact` says which.
+ */
+export class StaleBundleError extends Error {
+  constructor(
+    public readonly regionId: number,
+    public readonly artifact: "terrain.meta" | "locs" | "atlas",
+    public readonly found: number,
+    public readonly expected: number,
+  ) {
+    super(
+      `region ${regionId} ${artifact}.json has schemaVersion ${found}, ` +
+        `expected ${expected}. Re-run \`pnpm extract -- --region ${regionId}\`.`,
+    );
+    this.name = "StaleBundleError";
+  }
+}
 
 /**
  * Fetches a region bundle written by the extractor:
@@ -20,6 +47,9 @@ export interface RegionData {
   terrainColors: Uint8Array;
   terrainUvs: Float32Array;
   terrainHeights: Int16Array;
+  /** Plane-major Uint8 (4 × 64 × 64). 1 = blocked tile per
+   *  `tile.settings & 0x1` (gameplay-blocked, not render). */
+  terrainBlocked: Uint8Array;
 
   atlas: TextureAtlas;
   atlasUrl: string;
@@ -88,11 +118,39 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     fetchJson<TextureAtlas>(`${base}/atlas.json`),
   ]);
 
+  // Schema-version guard. Older bundles silently dropping new fields was
+  // a Phase 1 concern — explicit failure forces a re-extract instead.
+  if (terrainMeta.schemaVersion !== TERRAIN_META_SCHEMA) {
+    throw new StaleBundleError(
+      regionId,
+      "terrain.meta",
+      terrainMeta.schemaVersion,
+      TERRAIN_META_SCHEMA,
+    );
+  }
+  if (locs.schemaVersion !== LOCS_MANIFEST_SCHEMA) {
+    throw new StaleBundleError(
+      regionId,
+      "locs",
+      locs.schemaVersion,
+      LOCS_MANIFEST_SCHEMA,
+    );
+  }
+  if (atlas.schemaVersion !== TEXTURE_ATLAS_SCHEMA) {
+    throw new StaleBundleError(
+      regionId,
+      "atlas",
+      atlas.schemaVersion,
+      TEXTURE_ATLAS_SCHEMA,
+    );
+  }
+
   const [
     terrainPosBuf,
     terrainColBuf,
     terrainUvBuf,
     terrainHtsBuf,
+    terrainBlockedBuf,
     locsPosBuf,
     locsColBuf,
     locsUvBuf,
@@ -102,6 +160,7 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     fetchBinary(`${base}/${terrainMeta.colorsFile}`),
     fetchBinary(`${base}/${terrainMeta.uvsFile}`),
     fetchBinary(`${base}/${terrainMeta.heightsFile}`),
+    fetchBinary(`${base}/${terrainMeta.blockedFile}`),
     locs.positionsByteLength > 0
       ? fetchBinary(`${base}/${locs.positionsFile}`)
       : Promise.resolve(new ArrayBuffer(0)),
@@ -122,6 +181,7 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     terrainColors: new Uint8Array(terrainColBuf),
     terrainUvs: new Float32Array(terrainUvBuf),
     terrainHeights: new Int16Array(terrainHtsBuf),
+    terrainBlocked: new Uint8Array(terrainBlockedBuf),
     atlas,
     atlasUrl: `${base}/${atlas.atlasFile}`,
     locs,
@@ -143,7 +203,15 @@ export async function loadRegion(
     onPhaseChange?.({ phase: "ready" });
     return data;
   } catch (err) {
-    if (!autoExtract || !(err instanceof MissingBundleError)) throw err;
+    // Two conditions trigger a re-extract in dev: bundle missing entirely,
+    // or bundle present but schema is older than the loader expects (e.g.
+    // schema bumped since last extract). Both are caller-friendly.
+    const recoverable =
+      err instanceof MissingBundleError || err instanceof StaleBundleError;
+    if (!autoExtract || !recoverable) throw err;
+    if (err instanceof StaleBundleError) {
+      console.warn(`[loader] ${err.message} — auto re-extracting.`);
+    }
     onPhaseChange?.({ phase: "extracting" });
     await requestExtraction(regionId);
     onPhaseChange?.({ phase: "fetching" });

@@ -26,6 +26,8 @@ export { bakeObject, buildObjectCatalog } from "./entities/objectModel.js";
 export type { BakedObject, ObjectCatalogEntry } from "./entities/objectModel.js";
 export { bakeItem, buildItemCatalog } from "./entities/itemModel.js";
 export type { BakedItem, ItemCatalogEntry } from "./entities/itemModel.js";
+export { bakeSpotAnim, buildSpotAnimCatalog } from "./entities/spotAnimModel.js";
+export type { BakedSpotAnim, SpotAnimCatalogEntry } from "./entities/spotAnimModel.js";
 export { buildSequenceCatalog } from "./entities/sequenceCatalog.js";
 export type { SequenceCatalogEntry } from "./entities/sequenceCatalog.js";
 export { buildGlobalAtlas } from "./texture/atlas.js";
@@ -49,6 +51,12 @@ export type { BakedAtlas } from "./texture/atlas.js";
 export const REPO_ROOT = resolve(import.meta.dirname, "../../..");
 export const CACHE_DIR = join(REPO_ROOT, ".cache");
 export const VIEWER_REGIONS = join(REPO_ROOT, "packages/viewer/public/regions");
+/**
+ * Static catalog dump dir consumed by the viewer's `entityCatalog` loader
+ * when the dev server isn't running (i.e. `vite build` output). Cross-cutting
+ * Phase-4 prerequisite — see `docs/extraction-roadmap.md`.
+ */
+export const VIEWER_CATALOGS = join(REPO_ROOT, "packages/viewer/public/catalog");
 
 /**
  * Project default: build 234 (Oct 2025). Picked because it's the most recent
@@ -187,6 +195,72 @@ async function runCli(regionId: number, requestedBuild?: number): Promise<void> 
   }
 }
 
+/**
+ * Bake all four entity catalogs (npc, object, item, sequence) into static
+ * JSON files under `packages/viewer/public/catalog/`. The viewer's
+ * `entityCatalog` loader checks this path before falling back to the dev
+ * server's `/api/<name>-catalog` endpoint, so static deploys (`vite build`)
+ * pick these up without needing a live extractor.
+ *
+ * Idempotent — safe to re-run after schema changes. Writes are atomic per
+ * file (one `writeFile` each); intermediate state is fine.
+ */
+export async function dumpCatalogs(session: ExtractorSession): Promise<void> {
+  const { writeFile } = await import("node:fs/promises");
+  const { mkdirSync } = await import("node:fs");
+  const { buildNpcCatalog } = await import("./entities/npcModel.js");
+  const { buildObjectCatalog } = await import("./entities/objectModel.js");
+  const { buildItemCatalog } = await import("./entities/itemModel.js");
+  const { buildSpotAnimCatalog } = await import("./entities/spotAnimModel.js");
+  const { buildSequenceCatalog } = await import("./entities/sequenceCatalog.js");
+
+  mkdirSync(VIEWER_CATALOGS, { recursive: true });
+
+  console.log("[catalog] building npc / object / item / spotanim / sequence catalogs");
+  // Sequential, not parallel — they share the cache reader's request
+  // queue and racing them just thrashes that queue without speeding up.
+  const npc = await buildNpcCatalog(session.rs);
+  const obj = await buildObjectCatalog(session.rs);
+  const item = await buildItemCatalog(session.rs);
+  const spotAnim = await buildSpotAnimCatalog(session.rs);
+  const seq = await buildSequenceCatalog(session.rs);
+
+  // Dev server returns `{ entries: [...] }`; mirror the shape so the
+  // viewer's loader can use the same parser path for both static and dev.
+  await writeFile(
+    join(VIEWER_CATALOGS, "npc.json"),
+    JSON.stringify({ entries: npc }),
+  );
+  await writeFile(
+    join(VIEWER_CATALOGS, "object.json"),
+    JSON.stringify({ entries: obj }),
+  );
+  await writeFile(
+    join(VIEWER_CATALOGS, "item.json"),
+    JSON.stringify({ entries: item }),
+  );
+  await writeFile(
+    join(VIEWER_CATALOGS, "spotanim.json"),
+    JSON.stringify({ entries: spotAnim }),
+  );
+  await writeFile(
+    join(VIEWER_CATALOGS, "sequence.json"),
+    JSON.stringify({ entries: seq }),
+  );
+  console.log(
+    `[catalog] wrote ${npc.length} npcs, ${obj.length} objects, ${item.length} items, ${spotAnim.length} spotanims, ${seq.length} sequences → ${VIEWER_CATALOGS}`,
+  );
+}
+
+async function runCatalogCli(): Promise<void> {
+  const session = await openExtractorSession();
+  try {
+    await dumpCatalogs(session);
+  } finally {
+    session.close();
+  }
+}
+
 // Only run as a CLI when invoked directly (e.g. `tsx src/index.ts`). When
 // imported by the Vite middleware we skip sade entirely.
 const invokedAsCli =
@@ -198,7 +272,15 @@ if (invokedAsCli) {
     .describe("Extract one OSRS region into a Three.js-ready bundle.")
     .option("-r, --region", "Region id (regionX<<8 | regionZ). Default 12850 (Lumbridge).", 12850)
     .option("-b, --build", `OSRS build number. Default ${DEFAULT_BUILD} (library-compatible).`)
-    .action((opts: { region: number | string; build?: number | string }) => {
+    .option("--catalogs", "Skip region extraction; dump entity catalogs to public/catalog/.", false)
+    .action((opts: { region: number | string; build?: number | string; catalogs?: boolean }) => {
+      if (opts.catalogs) {
+        runCatalogCli().catch((e: unknown) => {
+          console.error("[catalog] failed:", e);
+          process.exit(1);
+        });
+        return;
+      }
       const regionId = typeof opts.region === "string" ? parseInt(opts.region, 10) : opts.region;
       if (!Number.isInteger(regionId) || regionId < 0 || regionId > 0xffff) {
         console.error(`Invalid region id: ${opts.region}`);

@@ -30,6 +30,7 @@ declare module "osrscachereader" {
     NPC: RSCacheConfigType;
     ITEM: RSCacheConfigType;
     SEQUENCE: RSCacheConfigType;
+    SPOTANIM: RSCacheConfigType;
     [key: string]: RSCacheConfigType | ((id: number) => RSCacheConfigType | undefined);
   };
 
@@ -127,6 +128,16 @@ declare module "osrscachereader" {
     members?: boolean;
     stackable?: number;
     category?: number;
+    /** Phase 4 catalog metadata. All optional — opcode-gated in the loader. */
+    examineText?: string;
+    /** GE buy price in coins. Loader stores raw int; default unset. */
+    cost?: number;
+    weight?: number;
+    isTradeable?: boolean;
+    /** Team-cape ID, 1..N. Default unset. */
+    team?: number;
+    /** Right-click sub-options (e.g. "Equip", "Wield"). Cache opcode 35. */
+    subops?: string[][];
   }
 
   export interface NpcDefinition {
@@ -159,6 +170,13 @@ declare module "osrscachereader" {
     heightScale?: number;
     category?: number;
     isMinimapVisible?: boolean;
+    /** Phase 4 picker metadata. */
+    renderPriority?: number;
+    rotationSpeed?: number;
+    /** `headIconArchiveIds[i]` indexes into the headicons sprite archive,
+     *  with `headIconSpriteIndex[i]` the cell within that archive. */
+    headIconArchiveIds?: number[];
+    headIconSpriteIndex?: number[];
   }
 
   export interface ObjectDefinition {
@@ -191,7 +209,40 @@ declare module "osrscachereader" {
     obstructsGround?: boolean;
     varbitID?: number;
     varpID?: number;
+    /** Cache opcode 77/92 — alternate locIds keyed by varbit/varp value.
+     *  `configChangeDest[i]` is the locId to render when the controlling
+     *  var equals `i`. Last entry is -1 (or, for opcode 92, the explicit
+     *  default-when-unmatched value). */
+    configChangeDest?: number[];
+    /** Phase 4 catalog metadata (loc category for picker filters). */
+    category?: number;
+    /** Phase 4 free-form key/value bag from `params{}` — script-driven
+     *  metadata (teleport destinations, varbit thresholds, etc.). Keys
+     *  are int paramId; values are string or number. */
+    params?: Record<string, string | number>;
     getModel(cache: RSCache, modelType: number, rotation: number): Promise<ModelDefinition | null>;
+  }
+
+  /**
+   * SpotAnim — projectiles, spell effects, gfx-on-NPC, hitsplats. Single
+   * model + optional animation. Per `osrscachereader/loaders/SpotAnimLoader.js`.
+   */
+  export interface SpotAnimDefinition {
+    id: number;
+    name?: string;
+    modelId?: number;
+    animationId?: number;
+    /** Scale multiplier × 128 (128 = 1×). */
+    resizeX?: number;
+    resizeY?: number;
+    /** Initial yaw, OSRS units (0..2047). */
+    rotation?: number;
+    ambient?: number;
+    contrast?: number;
+    recolorToFind?: number[];
+    recolorToReplace?: number[];
+    textureToFind?: number[];
+    textureToReplace?: number[];
   }
 
   export interface SequenceDefinition {

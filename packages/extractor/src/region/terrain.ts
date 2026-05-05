@@ -24,7 +24,15 @@ import type {
   DebugUnderlayDef,
   DebugOverlayDef,
 } from "@rsmap/shared";
-import { TILES_PER_SIDE, VERTICES_PER_SIDE, PLANES, TILE_SIZE, packRegionId } from "@rsmap/shared";
+import {
+  TILES_PER_SIDE,
+  VERTICES_PER_SIDE,
+  PLANES,
+  TILE_SIZE,
+  packRegionId,
+  TERRAIN_META_SCHEMA,
+  TERRAIN_DEBUG_SCHEMA,
+} from "@rsmap/shared";
 
 interface ResolvedPalette {
   underlays: Map<number, UnderlayDefinition>;
@@ -384,6 +392,10 @@ export interface BakedTerrain {
   uvs: Float32Array;
   heights: Int16Array;
   triangleTiles: Uint16Array;
+  /** Plane-major Uint8 (4 × 64 × 64). Bit 0x1 of `tile.settings` = "blocked"
+   *  per `memory/tile_settings_byte.md`. Always exactly 16 KB; small
+   *  enough to load eagerly even when passability isn't being used. */
+  blocked: Uint8Array;
   debug: TerrainDebug;
 }
 
@@ -400,6 +412,10 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   const perPlane: { positions: number[]; colors: number[]; uvs: number[]; triangleTiles: number[] }[] = [];
   // Debug tiles — one entry per (plane, x, z) we actually emit.
   const debugTiles: TerrainDebugTile[] = [];
+  // Per-tile passability bitmap (plane-major Uint8). Bit 0x1 of `settings`
+  // is the OSRS gameplay "blocked" flag (verified in
+  // `memory/tile_settings_byte.md`). Default 0 = walkable for missing tiles.
+  const blocked = new Uint8Array(PLANES * TILES_PER_SIDE * TILES_PER_SIDE);
   for (let plane = 0; plane < PLANES; plane++) {
     const positions: number[] = [];
     const colors: number[] = [];
@@ -450,6 +466,10 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
       for (let z = 0; z < TILES_PER_SIDE; z++) {
         const tile = map.tiles[plane]?.[x]?.[z];
         if (!tile) continue;
+
+        if (((tile.settings ?? 0) & 0x1) !== 0) {
+          blocked[plane * TILES_PER_SIDE * TILES_PER_SIDE + z * TILES_PER_SIDE + x] = 1;
+        }
 
         // Cache stores `overlayPath` in 0..11. The render shape index is
         // `overlayPath + 1` per `Landscape.java:517` (cross-checked in
@@ -618,7 +638,7 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   }
 
   const meta: TerrainMeta = {
-    schemaVersion: 2,
+    schemaVersion: TERRAIN_META_SCHEMA,
     regionId: packRegionId(regionX, regionZ),
     regionX,
     regionZ,
@@ -638,6 +658,8 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
     heightsByteLength: heights16.byteLength,
     triangleTilesFile: "terrain.tri_tiles.bin",
     triangleTilesByteLength: triangleTiles.byteLength,
+    blockedFile: "terrain.blocked.bin",
+    blockedByteLength: blocked.byteLength,
   };
 
   const debugUnderlays: Record<number, DebugUnderlayDef> = {};
@@ -669,14 +691,14 @@ export function emitTerrain(plan: TerrainPlan, atlas: BakedAtlas): BakedTerrain 
   }
 
   const debug: TerrainDebug = {
-    schemaVersion: 1,
+    schemaVersion: TERRAIN_DEBUG_SCHEMA,
     regionId: meta.regionId,
     tiles: debugTiles,
     underlays: debugUnderlays,
     overlays: debugOverlays,
   };
 
-  return { meta, positions, colors, uvs, heights: heights16, triangleTiles, debug };
+  return { meta, positions, colors, uvs, heights: heights16, triangleTiles, blocked, debug };
 }
 
 export async function writeTerrainBundle(baked: BakedTerrain, outDir: string): Promise<void> {
@@ -685,6 +707,7 @@ export async function writeTerrainBundle(baked: BakedTerrain, outDir: string): P
   await writeFile(join(outDir, baked.meta.uvsFile), Buffer.from(baked.uvs.buffer));
   await writeFile(join(outDir, baked.meta.heightsFile), Buffer.from(baked.heights.buffer));
   await writeFile(join(outDir, baked.meta.triangleTilesFile), Buffer.from(baked.triangleTiles.buffer));
+  await writeFile(join(outDir, baked.meta.blockedFile), Buffer.from(baked.blocked.buffer));
   await writeFile(join(outDir, "terrain.meta.json"), JSON.stringify(baked.meta, null, 2));
   await writeFile(join(outDir, "terrain.debug.json"), JSON.stringify(baked.debug));
   console.log(

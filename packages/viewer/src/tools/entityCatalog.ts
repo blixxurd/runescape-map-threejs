@@ -16,17 +16,44 @@ export interface NamedEntry {
 export interface NpcCatalogEntry extends NamedEntry {
   combatLevel: number;
   size: number;
+  /** Phase 4 picker metadata. All optional; undefined means cache opcode
+   *  didn't fire on this def. See `packages/extractor/src/entities/npcModel.ts`
+   *  → `buildNpcCatalog` for the source-of-truth filter rules. */
+  category?: number;
+  isMinimapVisible?: false;
+  renderPriority?: number;
+  rotationSpeed?: number;
+  headIconCount?: number;
 }
 
 export interface ObjectCatalogEntry extends NamedEntry {
   modelType: number;
   sizeX: number;
   sizeY: number;
+  /** Phase 4 picker metadata. */
+  category?: number;
+  /** Default 2 (blocks player+projectiles); only present when deviating. */
+  interactType?: number;
+  /** Cache opcode 249 free-form key/value bag. */
+  params?: Record<string, string | number>;
 }
 
 export interface ItemCatalogEntry extends NamedEntry {
   members: boolean;
   stackable: boolean;
+  /** Phase 4 picker metadata. */
+  examineText?: string;
+  category?: number;
+  cost?: number;
+  weight?: number;
+  isTradeable?: boolean;
+  subops?: string[][];
+  team?: number;
+}
+
+export interface SpotAnimCatalogEntry extends NamedEntry {
+  /** True when the def references an animation sequence. */
+  hasAnimation?: boolean;
 }
 
 /** Sequences come named only if they're in our static lookup table; the
@@ -37,14 +64,32 @@ export interface SequenceCatalogEntry {
   frameCount: number;
 }
 
-function makeLoader<T extends NamedEntry>(url: string): () => Promise<T[]> {
+/**
+ * Try the static catalog first (`/catalog/<name>.json`, baked by
+ * `pnpm extract --catalogs`), fall back to the dev-server endpoint
+ * (`/api/<name>-catalog`, computed live). Static deploys won't have
+ * the dev endpoint; dev environments may not have run the catalog
+ * dump yet.
+ */
+function makeLoader<T extends NamedEntry>(
+  staticUrl: string,
+  devUrl: string,
+): () => Promise<T[]> {
   let promise: Promise<T[]> | null = null;
   return async (): Promise<T[]> => {
     if (promise) return promise;
     promise = (async (): Promise<T[]> => {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`${url}: ${r.status}`);
-      const body = (await r.json()) as { entries: T[] };
+      // 404 on static is expected in dev when catalogs haven't been
+      // dumped — silently fall through. Other failures (5xx, network)
+      // we let surface from the dev fetch.
+      const staticRes = await fetch(staticUrl).catch(() => null);
+      if (staticRes && staticRes.ok) {
+        const body = (await staticRes.json()) as { entries: T[] };
+        return body.entries;
+      }
+      const devRes = await fetch(devUrl);
+      if (!devRes.ok) throw new Error(`${devUrl}: ${devRes.status}`);
+      const body = (await devRes.json()) as { entries: T[] };
       return body.entries;
     })();
     promise.catch(() => {
@@ -54,18 +99,37 @@ function makeLoader<T extends NamedEntry>(url: string): () => Promise<T[]> {
   };
 }
 
-export const loadNpcCatalog = makeLoader<NpcCatalogEntry>("/api/npc-catalog");
-export const loadObjectCatalog = makeLoader<ObjectCatalogEntry>("/api/object-catalog");
-export const loadItemCatalog = makeLoader<ItemCatalogEntry>("/api/item-catalog");
+export const loadNpcCatalog = makeLoader<NpcCatalogEntry>(
+  "/catalog/npc.json",
+  "/api/npc-catalog",
+);
+export const loadObjectCatalog = makeLoader<ObjectCatalogEntry>(
+  "/catalog/object.json",
+  "/api/object-catalog",
+);
+export const loadItemCatalog = makeLoader<ItemCatalogEntry>(
+  "/catalog/item.json",
+  "/api/item-catalog",
+);
+export const loadSpotAnimCatalog = makeLoader<SpotAnimCatalogEntry>(
+  "/catalog/spotanim.json",
+  "/api/spotanim-catalog",
+);
 // Sequence entries don't extend NamedEntry — they have no `name` field, the
 // UI layers names on top via `animationNames.ts`.
 let sequenceCatalogPromise: Promise<SequenceCatalogEntry[]> | null = null;
 export async function loadSequenceCatalog(): Promise<SequenceCatalogEntry[]> {
   if (sequenceCatalogPromise) return sequenceCatalogPromise;
   sequenceCatalogPromise = (async (): Promise<SequenceCatalogEntry[]> => {
-    const r = await fetch("/api/sequence-catalog");
-    if (!r.ok) throw new Error(`sequence catalog: ${r.status}`);
-    const body = (await r.json()) as { entries: SequenceCatalogEntry[] };
+    // Same static-then-dev fallback as the named catalogs above.
+    const staticRes = await fetch("/catalog/sequence.json").catch(() => null);
+    if (staticRes && staticRes.ok) {
+      const body = (await staticRes.json()) as { entries: SequenceCatalogEntry[] };
+      return body.entries;
+    }
+    const devRes = await fetch("/api/sequence-catalog");
+    if (!devRes.ok) throw new Error(`sequence catalog: ${devRes.status}`);
+    const body = (await devRes.json()) as { entries: SequenceCatalogEntry[] };
     return body.entries;
   })();
   sequenceCatalogPromise.catch(() => {

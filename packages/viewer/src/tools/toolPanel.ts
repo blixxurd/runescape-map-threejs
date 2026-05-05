@@ -2,12 +2,14 @@ import {
   loadNpcCatalog,
   loadObjectCatalog,
   loadItemCatalog,
+  loadSpotAnimCatalog,
   loadSequenceCatalog,
   searchEntries,
   type NamedEntry,
   type NpcCatalogEntry,
   type ObjectCatalogEntry,
   type ItemCatalogEntry,
+  type SpotAnimCatalogEntry,
   type SequenceCatalogEntry,
 } from "./entityCatalog.js";
 import { animationName, knownNamedAnimations } from "./animationNames.js";
@@ -20,7 +22,7 @@ import { animationName, knownNamedAnimations } from "./animationNames.js";
  * Interactions bubble out through the `host` callbacks — the panel never
  * touches the scene or the placer internals.
  */
-export type ModelTab = "npc" | "object" | "item";
+export type ModelTab = "npc" | "object" | "item" | "spotanim";
 
 export interface ToolPanelHost {
   /** User clicked a result in one of the model-backed tabs. */
@@ -43,7 +45,7 @@ export interface ToolPanelHost {
   onScreenshot(): void;
 }
 
-type AnyCatalog = NpcCatalogEntry[] | ObjectCatalogEntry[] | ItemCatalogEntry[];
+type AnyCatalog = NpcCatalogEntry[] | ObjectCatalogEntry[] | ItemCatalogEntry[] | SpotAnimCatalogEntry[];
 
 interface TabState {
   catalog: AnyCatalog | null;
@@ -171,6 +173,7 @@ export class ToolPanel {
     npc: { catalog: null, error: null, query: "", armedId: null },
     object: { catalog: null, error: null, query: "", armedId: null },
     item: { catalog: null, error: null, query: "", armedId: null },
+    spotanim: { catalog: null, error: null, query: "", armedId: null },
   };
 
   constructor(host: ToolPanelHost) {
@@ -199,6 +202,7 @@ export class ToolPanel {
         <button data-tab="npc" class="active">NPCs</button>
         <button data-tab="object">Objects</button>
         <button data-tab="item">Items</button>
+        <button data-tab="spotanim">FX</button>
       </div>
       <div class="body">
         <div class="panel panel-npc active" data-tab="npc">
@@ -222,10 +226,18 @@ export class ToolPanel {
           <div class="results"></div>
           <div class="hint">ground items use the inventory model. <b>R</b> rotates.</div>
         </div>
+        <div class="panel panel-spotanim" data-tab="spotanim">
+          <input class="search" type="text" placeholder="search effects…" autocomplete="off" />
+          <div class="armed" style="display:none"></div>
+          <div class="status">catalog not loaded — switch tab to start</div>
+          <div class="results"></div>
+          <div class="hint">spot anims = projectiles, spell impacts, gfx-on-NPC. one-shot animations freeze on their last frame.</div>
+        </div>
         <div class="actions">
           <button class="action" data-clear="npc" type="button">clear NPCs</button>
           <button class="action" data-clear="object" type="button">clear objects</button>
           <button class="action" data-clear="item" type="button">clear items</button>
+          <button class="action" data-clear="spotanim" type="button">clear FX</button>
           <button class="action" data-clear="all" type="button">clear all</button>
         </div>
       </div>
@@ -236,31 +248,37 @@ export class ToolPanel {
       npc: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="npc"]')!,
       object: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="object"]')!,
       item: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="item"]')!,
+      spotanim: this.root.querySelector<HTMLButtonElement>('.tabs button[data-tab="spotanim"]')!,
     };
     this.panels = {
       npc: this.root.querySelector<HTMLDivElement>(".panel-npc")!,
       object: this.root.querySelector<HTMLDivElement>(".panel-object")!,
       item: this.root.querySelector<HTMLDivElement>(".panel-item")!,
+      spotanim: this.root.querySelector<HTMLDivElement>(".panel-spotanim")!,
     };
     this.resultsEls = {
       npc: this.panels.npc.querySelector<HTMLDivElement>(".results")!,
       object: this.panels.object.querySelector<HTMLDivElement>(".results")!,
       item: this.panels.item.querySelector<HTMLDivElement>(".results")!,
+      spotanim: this.panels.spotanim.querySelector<HTMLDivElement>(".results")!,
     };
     this.searchInputs = {
       npc: this.panels.npc.querySelector<HTMLInputElement>(".search")!,
       object: this.panels.object.querySelector<HTMLInputElement>(".search")!,
       item: this.panels.item.querySelector<HTMLInputElement>(".search")!,
+      spotanim: this.panels.spotanim.querySelector<HTMLInputElement>(".search")!,
     };
     this.statusEls = {
       npc: this.panels.npc.querySelector<HTMLDivElement>(".status")!,
       object: this.panels.object.querySelector<HTMLDivElement>(".status")!,
       item: this.panels.item.querySelector<HTMLDivElement>(".status")!,
+      spotanim: this.panels.spotanim.querySelector<HTMLDivElement>(".status")!,
     };
     this.armedBanners = {
       npc: this.panels.npc.querySelector<HTMLDivElement>(".armed")!,
       object: this.panels.object.querySelector<HTMLDivElement>(".armed")!,
       item: this.panels.item.querySelector<HTMLDivElement>(".armed")!,
+      spotanim: this.panels.spotanim.querySelector<HTMLDivElement>(".armed")!,
     };
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
@@ -273,14 +291,14 @@ export class ToolPanel {
   }
 
   private wireEvents(): void {
-    for (const tab of ["npc", "object", "item"] as const) {
+    for (const tab of ["npc", "object", "item", "spotanim"] as const) {
       this.tabBtns[tab].addEventListener("click", () => this.setTab(tab));
     }
     this.root
       .querySelector<HTMLButtonElement>(".collapse")!
       .addEventListener("click", () => this.root.classList.toggle("collapsed"));
 
-    for (const tab of ["npc", "object", "item"] as const) {
+    for (const tab of ["npc", "object", "item", "spotanim"] as const) {
       const input = this.searchInputs[tab];
       input.addEventListener("input", () => {
         this.tabStates[tab].query = input.value;
@@ -361,6 +379,9 @@ export class ToolPanel {
     if (tab === "item" && !this.tabStates.item.catalog) {
       void this.loadCatalog("item");
     }
+    if (tab === "spotanim" && !this.tabStates.spotanim.catalog) {
+      void this.loadCatalog("spotanim");
+    }
     // Switching tabs cancels whatever was armed on the previous one —
     // prevents "I'm on Items but my clicks still place NPCs" confusion.
     this.cancelArmed();
@@ -368,8 +389,15 @@ export class ToolPanel {
 
   private async loadCatalog(tab: ModelTab): Promise<void> {
     const loader =
-      tab === "npc" ? loadNpcCatalog : tab === "object" ? loadObjectCatalog : loadItemCatalog;
-    const label = tab === "npc" ? "NPCs" : tab === "object" ? "objects" : "items";
+      tab === "npc"
+        ? loadNpcCatalog
+        : tab === "object"
+          ? loadObjectCatalog
+          : tab === "item"
+            ? loadItemCatalog
+            : loadSpotAnimCatalog;
+    const label =
+      tab === "npc" ? "NPCs" : tab === "object" ? "objects" : tab === "item" ? "items" : "FX";
     this.statusEls[tab].textContent = "loading catalog…";
     try {
       const catalog = (await loader()) as AnyCatalog;
@@ -439,7 +467,7 @@ export class ToolPanel {
   /** Called from main.ts when the user presses Escape anywhere, or when a
    *  fetch-triggered placement fails. */
   cancelArmed(): void {
-    for (const tab of ["npc", "object", "item"] as const) {
+    for (const tab of ["npc", "object", "item", "spotanim"] as const) {
       const s = this.tabStates[tab];
       if (s.armedId !== null) {
         s.armedId = null;
@@ -651,7 +679,7 @@ export class ToolPanel {
   /** Host tells us rotation changed via R keypress. Reflected in the banner
    *  so the user sees the pending orientation before clicking. */
   setRotation(rot: number): void {
-    for (const tab of ["npc", "object", "item"] as const) {
+    for (const tab of ["npc", "object", "item", "spotanim"] as const) {
       const s = this.tabStates[tab];
       if (s.armedId === null) continue;
       const banner = this.armedBanners[tab];
@@ -682,6 +710,11 @@ function metaLabel(tab: ModelTab, e: NamedEntry): string {
     const typeName = modelTypeName(o.modelType);
     const size = o.sizeX !== 1 || o.sizeY !== 1 ? `${o.sizeX}×${o.sizeY}` : "";
     return [typeName, size, `#${o.id}`].filter(Boolean).join(" · ");
+  }
+  if (tab === "spotanim") {
+    const s = e as SpotAnimCatalogEntry;
+    const animFlag = s.hasAnimation ? "anim" : "";
+    return [animFlag, `#${s.id}`].filter(Boolean).join(" · ");
   }
   const it = e as ItemCatalogEntry;
   const flags = [it.members ? "mem" : "", it.stackable ? "stack" : ""].filter(Boolean).join("/");

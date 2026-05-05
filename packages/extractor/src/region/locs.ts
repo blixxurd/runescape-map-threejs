@@ -12,8 +12,13 @@ import { join } from "node:path";
 import { hsl16ToRgb } from "../color/hsl.js";
 import { computeFaceUv, cellUV } from "../texture/locFaceUv.js";
 import type { BakedAtlas } from "../texture/atlas.js";
-import type { LocsManifest, LocBlock, LocPlacement, LocsDebug, LocDebugBlock } from "@rsmap/shared";
-import { TILE_SIZE, TILES_PER_SIDE } from "@rsmap/shared";
+import type { LocsManifest, LocBlock, LocPlacement, LocsDebug, LocDebugBlock, LocMorphSpec } from "@rsmap/shared";
+import {
+  TILE_SIZE,
+  TILES_PER_SIDE,
+  LOCS_MANIFEST_SCHEMA,
+  LOCS_DEBUG_SCHEMA,
+} from "@rsmap/shared";
 import { applyFramePose, rotateModelVertices } from "./animate.js";
 
 import {
@@ -59,6 +64,60 @@ function expandPlacement(type: number, rotation: number): BlockDraw[] {
   }
 }
 
+/**
+ * Per-rotation wall-edge bits. Verbatim from `reference/Scene.java:16-17`
+ * (`ROTATION_WALL_TYPE` / `ROTATION_WALL_CORNER_TYPE`). Indexed by the
+ * cache-level `face` / `rotation` 0..3.
+ *
+ * Bit semantics (OSRS-native compass, +Y = north):
+ *   0x01=W  0x02=N  0x04=E  0x08=S
+ *   0x10=SW 0x20=NW 0x40=NE 0x80=SE  (corner-pillar variants)
+ *
+ * Compass mapping cross-checked against the `tileCullingBitsets` /
+ * `tileShadowIntensity` writes in `reference/Landscape.java:953..1043`:
+ *   face 0 → west wall (extends along x=localX from y..y+1)
+ *   face 1 → north wall (extends along y=localY+1 from x..x+1)
+ *   face 2 → east wall  (extends along x=localX+1 from y..y+1)
+ *   face 3 → south wall (extends along y=localY from x..x+1)
+ */
+const ROTATION_WALL_TYPE = [0x01, 0x02, 0x04, 0x08] as const;
+const ROTATION_WALL_CORNER_TYPE = [0x10, 0x20, 0x40, 0x80] as const;
+
+/**
+ * Bake wall-edge / corner-block bits for a single placement.
+ *
+ *   type 0 (WALL):              `ROTATION_WALL_TYPE[rotation]`
+ *   type 1 (WALL_TRI_CORNER):   `ROTATION_WALL_CORNER_TYPE[rotation]`
+ *   type 2 (WALL_CORNER):       two adjacent edges
+ *                                 `ROTATION_WALL_TYPE[rotation] |
+ *                                  ROTATION_WALL_TYPE[(rotation+1)&3]`
+ *   type 3 (WALL_RECT_CORNER):  `ROTATION_WALL_CORNER_TYPE[rotation]`
+ *   types 4..8 (wall decor):    no edge blocking (decorative; collision
+ *                                follows the parent wall, not the decor)
+ *   types 9..22 (full-tile):    no edge blocking (consumer applies
+ *                                center-tile block via interactType +
+ *                                sizeX/Y footprint)
+ *
+ * If `blockingMask` (cache opcode 79) is non-zero, it overrides this
+ * derivation entirely. The override is applied at the call site so the
+ * default table stays simple.
+ */
+function deriveBlockedEdges(origType: number, origRotation: number): number {
+  const rot = origRotation & 3;
+  switch (origType) {
+    case 0: // WALL
+      return ROTATION_WALL_TYPE[rot]!;
+    case 1: // WALL_TRI_CORNER
+      return ROTATION_WALL_CORNER_TYPE[rot]!;
+    case 2: // WALL_CORNER (two adjacent edges, faces rot and rot+1)
+      return ROTATION_WALL_TYPE[rot]! | ROTATION_WALL_TYPE[(rot + 1) & 3]!;
+    case 3: // WALL_RECT_CORNER
+      return ROTATION_WALL_CORNER_TYPE[rot]!;
+    default:
+      return 0;
+  }
+}
+
 // ---------- Phase 1: resolve ----------
 
 interface ResolvedBlock {
@@ -78,6 +137,27 @@ interface ResolvedBlock {
    *  (the client treats that as an upper Y-threshold above which
    *  deformation stops; used by trees so the canopy stays stable). */
   contouredThreshold: number;
+  /** Phase 1 def-level passthroughs. All optional except `interactType`
+   *  (0 default). Cleaned up in `pushBlock` — the JSON only carries them
+   *  when meaningfully different from defaults. */
+  defFields: {
+    interactType: number;
+    name?: string;
+    obstructsGround?: boolean;
+    /** Only persisted when `false` (default true). */
+    shadow?: false;
+    hollow?: boolean;
+    supportsItems?: number;
+    /** Default 16; only persisted when different. */
+    decorDisplacement?: number;
+    wallOrDoor?: number;
+    mapSceneID?: number;
+    mapAreaId?: number;
+    randomizeAnimStart?: boolean;
+    /** Phase 2: cache opcode 79 blockingMask override. Default 0 (use the
+     *  type-derived bits). Only persisted on LocBlock when non-zero. */
+    blockingMask?: number;
+  };
   /** The *base* model, pre-animation. For animated blocks the caller
    *  clones vertex positions per-frame and applies the matching frame;
    *  for static blocks this is just the final model. */
@@ -116,6 +196,12 @@ export interface LocsPlan {
   /** Number of *blocks* that had frame-0 animation successfully baked into
    *  vertex positions. Diagnostic only. */
   animatedBlockCount: number;
+  /** Phase 5: per-source-locId morph spec, captured during `prepareLocs` from
+   *  `objDef.varbitID/varpID/configChangeDest`. Empty when the region has
+   *  no morphing locs (most regions). Each alternate locId in the spec
+   *  has its blocks already resolved into `blocks` via the same
+   *  `(modelType, bakedRotation)` set as the source loc. */
+  morphs: Map<number, { varKind: "varbit" | "varp"; varId: number; alternates: number[] }>;
   /** One-shot census over unique locIds that appeared in the region. Counts
    *  *unique defs* with each feature set, not placements — use the raw
    *  numbers as a cost/benefit signal before implementing a new field. */
@@ -225,6 +311,7 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
       skipReasons: { noDef: 0, noModel: 0, emptyModel: 0, error: 0 },
       animatedBlockCount: 0,
       defCensus: emptyCensus,
+      morphs: new Map(),
     };
   }
   console.log(`[locs] ${locDef.locations.length} placements`);
@@ -262,6 +349,57 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     defCache.set(locId, def);
     return def;
   };
+
+  // Phase 5: pre-scan placements for varbit/varp morph defs. For each
+  // morphing source locId, expand `uniqueDraws` to also bake every
+  // alternate locId at the same (modelType, bakedRotation) the source
+  // is drawn at. The viewer then picks one based on var state at runtime.
+  // We do this BEFORE the main resolve loop so the alternates ride the
+  // same model fetch / atlas pipeline.
+  const morphs = new Map<
+    number,
+    { varKind: "varbit" | "varp"; varId: number; alternates: number[] }
+  >();
+  // Preserve the per-source draw set so we know which (modelType, rotation)
+  // combos to instantiate the alternates with.
+  const drawsBySourceLoc = new Map<number, BlockDraw[]>();
+  for (const p of locDef.locations) {
+    if (!drawsBySourceLoc.has(p.id)) {
+      drawsBySourceLoc.set(p.id, expandPlacement(p.type, p.orientation));
+    }
+  }
+  for (const [sourceLocId, draws] of drawsBySourceLoc) {
+    const def = await getObjDef(sourceLocId);
+    if (!def) continue;
+    const dx = def as unknown as {
+      varbitID?: number;
+      varpID?: number;
+      configChangeDest?: number[];
+    };
+    const dest = dx.configChangeDest;
+    if (!dest || dest.length === 0) continue;
+    // Either varbit or varp may be set (-1 if not). Prefer varbit (the
+    // OSRS client checks varbit first; varp is the fallback for older
+    // morph defs).
+    const hasVarbit = dx.varbitID !== undefined && dx.varbitID >= 0;
+    const hasVarp = dx.varpID !== undefined && dx.varpID >= 0;
+    if (!hasVarbit && !hasVarp) continue;
+    const varKind: "varbit" | "varp" = hasVarbit ? "varbit" : "varp";
+    const varId = hasVarbit ? dx.varbitID! : dx.varpID!;
+    morphs.set(sourceLocId, { varKind, varId, alternates: dest.slice() });
+    for (const altLocId of dest) {
+      if (altLocId < 0 || altLocId === sourceLocId) continue;
+      for (const d of draws) {
+        const k = drawKey(altLocId, d.modelType, d.bakedRotation);
+        if (!uniqueDraws.has(k)) {
+          uniqueDraws.set(k, { locId: altLocId, modelType: d.modelType, bakedRotation: d.bakedRotation });
+        }
+      }
+    }
+  }
+  if (morphs.size > 0) {
+    console.log(`[locs] ${morphs.size} morphing locs; expanded uniqueDraws to ${uniqueDraws.size}`);
+  }
 
   // Per-session cache so we don't re-fetch the same SeqDefinition 20 times.
   const seqCache = new Map<number, SequenceDefinition | null>();
@@ -416,6 +554,62 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     const contrastOverride = (objDef as unknown as { contrast?: number }).contrast ?? 0;
     const rawContour = (objDef as unknown as { contouredGround?: number }).contouredGround;
     const contoured = rawContour !== undefined;
+    // Phase 1 def-level passthroughs. `objDef` is typed minimally in our
+    // ambient declarations; broaden via cast so we can reach the rarer
+    // opcodes (loader populates them, type defs just don't list them all).
+    const dx = objDef as unknown as {
+      name?: string;
+      interactType?: number;
+      obstructsGround?: boolean;
+      shadow?: boolean;
+      hollow?: boolean;
+      supportsItems?: number;
+      decorDisplacement?: number;
+      wallOrDoor?: number;
+      mapSceneID?: number;
+      mapAreaId?: number;
+      randomizeAnimStart?: boolean;
+      blockingMask?: number;
+    };
+    // Cache defaults set by osrscachereader's ObjectDefinition constructor
+    // (verified against
+    // node_modules/osrscachereader/src/cacheReader/loaders/ObjectLoader.js):
+    //   interactType = 2  (blocks player + projectiles)
+    //   wallOrDoor = -1   (no wall/door semantics)
+    //   mapSceneID = -1   (no minimap icon)
+    //   supportsItems = -1 (no item-on-loc support)
+    //   mapAreaId = -1    (no area tag)
+    //   decorDisplacement default = 16
+    // Persist into the bundle only when the cache opcode actually fired —
+    // i.e. when the field deviates from these defaults. Saves ~80 KB on
+    // Lumbridge's locs.debug.json.
+    const defFields: ResolvedBlock["defFields"] = {
+      interactType: dx.interactType ?? 2,
+    };
+    if (dx.name !== undefined) defFields.name = dx.name;
+    if (dx.obstructsGround) defFields.obstructsGround = true;
+    if (dx.shadow === false) defFields.shadow = false;
+    if (dx.hollow) defFields.hollow = true;
+    if (dx.supportsItems !== undefined && dx.supportsItems !== -1) {
+      defFields.supportsItems = dx.supportsItems;
+    }
+    if (dx.decorDisplacement !== undefined && dx.decorDisplacement !== 16) {
+      defFields.decorDisplacement = dx.decorDisplacement;
+    }
+    if (dx.wallOrDoor !== undefined && dx.wallOrDoor !== -1) {
+      defFields.wallOrDoor = dx.wallOrDoor;
+    }
+    if (dx.mapSceneID !== undefined && dx.mapSceneID !== -1) {
+      defFields.mapSceneID = dx.mapSceneID;
+    }
+    if (dx.mapAreaId !== undefined && dx.mapAreaId !== -1) {
+      defFields.mapAreaId = dx.mapAreaId;
+    }
+    if (dx.randomizeAnimStart) defFields.randomizeAnimStart = true;
+    if (dx.blockingMask !== undefined && dx.blockingMask !== 0) {
+      defFields.blockingMask = dx.blockingMask;
+    }
+
     blocks.push({
       key,
       locId: draw.locId,
@@ -427,6 +621,7 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
       contrast: BASE_CONTRAST + contrastOverride,
       contoured,
       contouredThreshold: rawContour ?? 0,
+      defFields,
       model,
       animationFrames,
       animationFrameStep,
@@ -453,6 +648,7 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     skipReasons,
     animatedBlockCount: animatedCount,
     defCensus,
+    morphs,
   };
 }
 
@@ -872,6 +1068,7 @@ export function emitLocs(
         frameTicks: rb.animationFrames.map((f) => f.ticks),
         framesByteOffset,
         frameStep: rb.animationFrameStep ?? -1,
+        randomizePhase: rb.defFields.randomizeAnimStart === true,
       };
     }
     blocks.push({
@@ -887,6 +1084,10 @@ export function emitLocs(
       uvsByteOffset: uvByteCursor,
       bboxMin: flat.bbox.min,
       bboxMax: flat.bbox.max,
+      interactType: rb.defFields.interactType,
+      ...(rb.defFields.blockingMask !== undefined
+        ? { blockingMask: rb.defFields.blockingMask }
+        : {}),
       animation,
     });
     const m = rb.model;
@@ -897,6 +1098,7 @@ export function emitLocs(
       if (m.faceTextures && (m.faceTextures[i] as number) >= 0) texturedFaceCount++;
       if (m.faceColors) distinct.add(m.faceColors[i] as number);
     }
+    const df = rb.defFields;
     debugBlocks.push({
       locId: rb.locId,
       modelType: rb.modelType,
@@ -904,6 +1106,17 @@ export function emitLocs(
       faceCount,
       texturedFaceCount,
       distinctFaceColors: distinct.size,
+      interactType: df.interactType,
+      ...(df.name !== undefined ? { name: df.name } : {}),
+      ...(df.obstructsGround ? { obstructsGround: true } : {}),
+      ...(df.shadow === false ? { shadow: false as const } : {}),
+      ...(df.hollow ? { hollow: true } : {}),
+      ...(df.supportsItems !== undefined ? { supportsItems: df.supportsItems } : {}),
+      ...(df.decorDisplacement !== undefined ? { decorDisplacement: df.decorDisplacement } : {}),
+      ...(df.wallOrDoor !== undefined ? { wallOrDoor: df.wallOrDoor } : {}),
+      ...(df.mapSceneID !== undefined ? { mapSceneID: df.mapSceneID } : {}),
+      ...(df.mapAreaId !== undefined ? { mapAreaId: df.mapAreaId } : {}),
+      ...(df.randomizeAnimStart ? { randomizeAnimStart: true } : {}),
     });
     positionsChunks.push(flat.positions);
     colorsChunks.push(flat.colors);
@@ -985,6 +1198,22 @@ export function emitLocs(
           blockIndex = sharedIndex;
         }
 
+        // Phase 2: derived per-placement edge/corner block bits.
+        // `expandPlacement` may have emitted multiple draws per cache
+        // record (e.g. WALL_CORNER → two halves), but each draw is one
+        // LocPlacement and should report the same blockedEdges since
+        // collision is per-cache-record, not per-half. The reference
+        // client does this in `Landscape.java:1017`: it calls `addWall`
+        // once per cache record with both orientations OR'd in.
+        //
+        // `blockingMask` (cache opcode 79) overrides the type-derived
+        // table when set — applies to every draw of the same record.
+        const mask = rb.defFields.blockingMask;
+        const blockedEdges =
+          mask !== undefined && mask !== 0
+            ? mask & 0xff
+            : deriveBlockedEdges(p.type, p.orientation);
+
         placements.push({
           locId: p.id,
           origType: p.type,
@@ -993,6 +1222,7 @@ export function emitLocs(
           z: p.position.localY,
           plane: p.position.height,
           blockIndex,
+          blockedEdges,
         });
       }
     }
@@ -1020,8 +1250,21 @@ export function emitLocs(
   }
 
   const hasFrames = framesPositions.byteLength > 0;
+  // Phase 5: serialise morphs map → JSON-friendly object. Skipped when
+  // empty (most regions; Lumbridge had 0 morph defs in earlier census).
+  let morphsJson: Record<number, LocMorphSpec> | undefined;
+  if (plan.morphs.size > 0) {
+    morphsJson = {};
+    for (const [sourceLocId, spec] of plan.morphs) {
+      morphsJson[sourceLocId] = {
+        varKind: spec.varKind,
+        varId: spec.varId,
+        alternates: spec.alternates.slice(),
+      };
+    }
+  }
   const manifest: LocsManifest = {
-    schemaVersion: 2,
+    schemaVersion: LOCS_MANIFEST_SCHEMA,
     blocks,
     placements,
     positionsByteLength: positions.byteLength,
@@ -1033,12 +1276,13 @@ export function emitLocs(
     framesFile: hasFrames ? "locs.frames.pos.bin" : undefined,
     framesByteLength: hasFrames ? framesPositions.byteLength : undefined,
     skippedLocIds: Array.from(plan.skippedLocIds).sort((a, b) => a - b),
+    ...(morphsJson ? { morphs: morphsJson } : {}),
   };
 
   // debugBlocks is built up in parallel with `blocks` inside `pushBlock`,
   // so the two arrays share indices — contoured placements each get their
   // own per-placement debug entry.
-  const debug: LocsDebug = { schemaVersion: 1, blocks: debugBlocks };
+  const debug: LocsDebug = { schemaVersion: LOCS_DEBUG_SCHEMA, blocks: debugBlocks };
 
   const r = plan.skipReasons;
   console.log(

@@ -6,6 +6,7 @@
   "packageManager": "pnpm@9.12.0",
   "scripts": {
     "extract": "pnpm --filter @rsmap/extractor run extract",
+    "catalogs": "pnpm --filter @rsmap/extractor run extract --catalogs",
     "dev": "pnpm --filter @rsmap/viewer run dev",
     "build": "pnpm --filter @rsmap/viewer run build",
     "typecheck": "pnpm -r run typecheck"

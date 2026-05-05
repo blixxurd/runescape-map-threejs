@@ -108,6 +108,18 @@ export interface ItemCatalogEntry {
   name: string;
   members: boolean;
   stackable: boolean;
+  /** Phase 4 picker-metadata. All optional — included only when the cache
+   *  opcode actually fires (rare for some fields). Use null/undefined to
+   *  skip filters that don't apply. */
+  examineText?: string;
+  category?: number;
+  cost?: number;
+  weight?: number;
+  isTradeable?: boolean;
+  /** Right-click sub-options like ["Equip","Wield"], one inner array per
+   *  click slot (1..5). Empty arrays elided. */
+  subops?: string[][];
+  team?: number;
 }
 
 /**
@@ -124,12 +136,25 @@ export async function buildItemCatalog(rs: RSCache): Promise<ItemCatalogEntry[]>
     if (!d.name || d.name.toLowerCase() === "null") continue;
     if ((d.inventoryModel ?? -1) < 0) continue;
     if (isTemplated(d)) continue;
-    out.push({
+    const entry: ItemCatalogEntry = {
       id: d.id,
       name: d.name,
       members: d.members ?? false,
       stackable: (d.stackable ?? 0) !== 0,
-    });
+    };
+    // Trim noise: only persist fields the cache actually populated. A
+    // catalog entry should be ~50 bytes for a typical item; the Phase 4
+    // additions add ~5–30 more depending on how many opcodes fired.
+    if (d.examineText) entry.examineText = d.examineText;
+    if (d.category !== undefined) entry.category = d.category;
+    if (d.cost !== undefined) entry.cost = d.cost;
+    if (d.weight !== undefined) entry.weight = d.weight;
+    if (d.isTradeable) entry.isTradeable = true;
+    if (d.team !== undefined && d.team !== 0) entry.team = d.team;
+    if (d.subops && d.subops.some((s) => s && s.length > 0)) {
+      entry.subops = d.subops.map((s) => (Array.isArray(s) ? [...s] : []));
+    }
+    out.push(entry);
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;

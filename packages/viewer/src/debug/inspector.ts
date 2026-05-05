@@ -302,6 +302,20 @@ export class DebugInspector {
     const hsl_sat = (hsl >> 7) & 7;
     const hsl_lum = hsl & 127;
 
+    // Decode the settings byte into the bit-by-bit names from
+    // `memory/tile_settings_byte.md` so the inspector reads as more than
+    // a hex value. Bit 0x1 == "blocked tile" is the only one with a real
+    // gameplay effect that we surface today.
+    const settingsBits: string[] = [];
+    if (tile.settings & 0x1) settingsBits.push("blocked");
+    if (tile.settings & 0x2) settingsBits.push("bridge");
+    if (tile.settings & 0x4) settingsBits.push("indoor");
+    if (tile.settings & 0x8) settingsBits.push("forceMinL0");
+    if (tile.settings & 0x10) settingsBits.push("hideFromPlayerLevel");
+    const settingsLabel = settingsBits.length
+      ? `${tile.settings} (${settingsBits.join(",")})`
+      : String(tile.settings);
+
     this.panel.innerHTML = `<b>terrain tile</b>
 <span class="k">region:</span> <span class="v">${region.regionId}</span>  <span class="k">plane:</span> <span class="v">${plane}</span>  <span class="k">tile:</span> <span class="v">(${tileX}, ${tileZ})</span>
 <span class="k">world:</span> <span class="v">(${hitPos.x.toFixed(0)}, ${hitPos.y.toFixed(0)}, ${hitPos.z.toFixed(0)})</span>
@@ -310,14 +324,14 @@ export class DebugInspector {
 <span class="k">overlay:</span> <span class="v">${tile.overlayId}</span>  <span class="k">tex:</span> <span class="v">${overlayTexId}</span>
   shape=${tile.overlayShape} rot=${tile.overlayRotation}  hideUnder=${odef?.hideUnderlay ?? "—"}
 <span class="k">blended HSL16:</span> <span class="v">0x${hsl.toString(16)}</span>  h=${hsl_hue} s=${hsl_sat} l=${hsl_lum}
-<span class="k">settings:</span> <span class="v">${tile.settings}</span>`;
+<span class="k">settings:</span> <span class="v">${settingsLabel}</span>`;
 
     this.lastPasteBlock = [
       `[region ${region.regionId} / terrain tile]`,
       `plane=${plane}  tile=(${tileX}, ${tileZ})  world=(${hitPos.x.toFixed(0)}, ${hitPos.y.toFixed(0)}, ${hitPos.z.toFixed(0)})`,
       `underlay=${tile.underlayId} tex=${underlayTexId}  rawRGB=${hex(udef?.rawRgb)}  hue=${udef?.hue ?? "-"} sat=${udef?.saturation ?? "-"} lum=${udef?.lightness ?? "-"} mul=${udef?.hueMultiplier ?? "-"}`,
       `overlay=${tile.overlayId} tex=${overlayTexId}  shape=${tile.overlayShape} rot=${tile.overlayRotation}  hideUnder=${odef?.hideUnderlay ?? "-"}  packedHsl=${odef?.packedHsl !== undefined ? "0x" + odef.packedHsl.toString(16) : "-"}`,
-      `blendedHSL=0x${hsl.toString(16)}  h=${hsl_hue} s=${hsl_sat} l=${hsl_lum}  settings=${tile.settings}`,
+      `blendedHSL=0x${hsl.toString(16)}  h=${hsl_hue} s=${hsl_sat} l=${hsl_lum}  settings=${settingsLabel}`,
       `bundle: build=${region.terrainMeta.buildId} cache=${region.terrainMeta.sourceCacheId}`,
     ].join("\n");
   }
@@ -411,7 +425,62 @@ export class DebugInspector {
     const modelTypeName = MODEL_TYPE_NAMES[block.modelType] ?? "?";
 
     const animLine = block.animation
-      ? `  anim: ${block.animation.frameCount} frames, ticks=[${block.animation.frameTicks.join(",")}], frameStep=${block.animation.frameStep}`
+      ? `  anim: ${block.animation.frameCount} frames, ticks=[${block.animation.frameTicks.join(",")}], frameStep=${block.animation.frameStep}${block.animation.randomizePhase ? " (randomized phase)" : ""}`
+      : "";
+
+    const interactLabel = (() => {
+      switch (block.interactType) {
+        case 0:
+          return "0 (walkable)";
+        case 1:
+          return "1 (blocks player)";
+        case 2:
+          return "2 (blocks player + projectiles)";
+        default:
+          return String(block.interactType);
+      }
+    })();
+
+    // Decode `blockedEdges` into compass edge names. Bit semantics
+    // documented in shared/region-bundle.ts → `LocPlacement.blockedEdges`.
+    // The 0x10..0x80 corner bits show up only for type-1/3 walls.
+    const blockedBits: string[] = [];
+    if (placement.blockedEdges & 0x01) blockedBits.push("W");
+    if (placement.blockedEdges & 0x02) blockedBits.push("N");
+    if (placement.blockedEdges & 0x04) blockedBits.push("E");
+    if (placement.blockedEdges & 0x08) blockedBits.push("S");
+    if (placement.blockedEdges & 0x10) blockedBits.push("SW-corner");
+    if (placement.blockedEdges & 0x20) blockedBits.push("NW-corner");
+    if (placement.blockedEdges & 0x40) blockedBits.push("NE-corner");
+    if (placement.blockedEdges & 0x80) blockedBits.push("SE-corner");
+    const blockedEdgesLabel = placement.blockedEdges === 0
+      ? "0 (none)"
+      : `0x${placement.blockedEdges.toString(16)} (${blockedBits.join(",")})`;
+    const blockingMaskLabel = block.blockingMask !== undefined
+      ? `  override=0x${block.blockingMask.toString(16)}`
+      : "";
+
+    // Phase 5: morph spec lookup. The placement's locId is the *source*
+    // loc; alternates render in its place when the controlling var fires.
+    const morph = region.locsManifest.morphs?.[block.locId];
+    const morphLine = morph
+      ? `\n<span class="k">morph:</span> <span class="v">${morph.varKind}=${morph.varId}</span>  alts=[${morph.alternates.join(", ")}]`
+      : "";
+
+    // Phase 1 def-level extras. Only render the segments that have data
+    // (most defs only set a couple) so the panel doesn't bloat.
+    const defExtras: string[] = [];
+    if (dbg?.obstructsGround) defExtras.push("obstructsGround");
+    if (dbg?.shadow === false) defExtras.push("noShadow");
+    if (dbg?.hollow) defExtras.push("hollow");
+    if (dbg?.supportsItems !== undefined) defExtras.push(`supportsItems=${dbg.supportsItems}`);
+    if (dbg?.decorDisplacement !== undefined) defExtras.push(`decorDisp=${dbg.decorDisplacement}`);
+    if (dbg?.wallOrDoor !== undefined) defExtras.push(`wallOrDoor=${dbg.wallOrDoor}`);
+    if (dbg?.mapSceneID !== undefined) defExtras.push(`mapSceneID=${dbg.mapSceneID}`);
+    if (dbg?.mapAreaId !== undefined) defExtras.push(`mapAreaId=${dbg.mapAreaId}`);
+    if (dbg?.randomizeAnimStart) defExtras.push("randomizeAnimStart");
+    const defExtrasLine = defExtras.length
+      ? `\n<span class="k">def:</span> <span class="v">${defExtras.join("  ")}</span>`
       : "";
 
     this.panel.innerHTML = `<b>loc</b>
@@ -420,15 +489,22 @@ export class DebugInspector {
 <span class="k">cache type:</span> <span class="v">${placement.origType}</span> (${origTypeName})  <span class="k">rot:</span> <span class="v">${placement.origRotation}</span>
 <span class="k">model type:</span> <span class="v">${block.modelType}</span> (${modelTypeName})  <span class="k">baked rot:</span> <span class="v">${block.bakedRotation}</span>
 <span class="k">block:</span> <span class="v">${blockIdx}</span>  <span class="k">instance:</span> <span class="v">${instanceLabel}</span>
-<span class="k">faces:</span> <span class="v">${dbg?.faceCount ?? "?"}</span>  <span class="k">textured:</span> <span class="v">${dbg?.texturedFaceCount ?? "?"}</span>  <span class="k">distinctColors:</span> <span class="v">${dbg?.distinctFaceColors ?? "?"}</span>${animLine ? `\n<span class="k">animation:</span> <span class="v">${block.animation!.frameCount} frames</span>  <span class="k">ticks:</span> <span class="v">[${block.animation!.frameTicks.join(",")}]</span>  <span class="k">frameStep:</span> <span class="v">${block.animation!.frameStep}</span>` : ""}`;
+<span class="k">interact:</span> <span class="v">${interactLabel}</span>
+<span class="k">blockedEdges:</span> <span class="v">${blockedEdgesLabel}${blockingMaskLabel}</span>${morphLine}
+<span class="k">faces:</span> <span class="v">${dbg?.faceCount ?? "?"}</span>  <span class="k">textured:</span> <span class="v">${dbg?.texturedFaceCount ?? "?"}</span>  <span class="k">distinctColors:</span> <span class="v">${dbg?.distinctFaceColors ?? "?"}</span>${defExtrasLine}${animLine ? `\n<span class="k">animation:</span> <span class="v">${block.animation!.frameCount} frames</span>  <span class="k">ticks:</span> <span class="v">[${block.animation!.frameTicks.join(",")}]</span>  <span class="k">frameStep:</span> <span class="v">${block.animation!.frameStep}</span>${block.animation!.randomizePhase ? `  <span class="k">randomizePhase</span>` : ""}` : ""}`;
 
     this.lastPasteBlock = [
       `[region ${region.regionId} / loc]`,
       `locId=${block.locId}${dbg?.name ? `  "${dbg.name}"` : ""}  tile=(${placement.x}, ${placement.z})  plane=${placement.plane}`,
       `cache: type=${placement.origType} (${origTypeName})  rot=${placement.origRotation}`,
       `model: type=${block.modelType} (${modelTypeName})  bakedRot=${block.bakedRotation}  block=${blockIdx}  instance=${instanceLabel}`,
+      `interact: ${interactLabel}  blockedEdges: ${blockedEdgesLabel}${blockingMaskLabel}`,
+      morph
+        ? `morph: ${morph.varKind}=${morph.varId}  alts=[${morph.alternates.join(", ")}]`
+        : "",
       `geometry: faces=${dbg?.faceCount ?? "?"}  textured=${dbg?.texturedFaceCount ?? "?"}  distinctColors=${dbg?.distinctFaceColors ?? "?"}${animLine}`,
+      defExtras.length ? `def: ${defExtras.join("  ")}` : "",
       `bundle: build=${region.terrainMeta.buildId} cache=${region.terrainMeta.sourceCacheId}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 }

@@ -329,11 +329,12 @@ async function main(): Promise<void> {
       `center ${CENTER_REGION_ID}  build ${BUILD_ID ?? "?"}  under camera: ${camId}\n` +
         `${regions.size} regions loaded${inflight.length > 0 ? " · " + inflight.join(" · ") : ""}` +
         (failed.size > 0 ? `  (skipped ${failed.size})` : "") +
-        (counts.npc + counts.object + counts.item > 0
+        (counts.npc + counts.object + counts.item + counts.spotanim > 0
           ? `  · placed: ${[
               counts.npc ? `${counts.npc} npc` : "",
               counts.object ? `${counts.object} obj` : "",
               counts.item ? `${counts.item} item` : "",
+              counts.spotanim ? `${counts.spotanim} fx` : "",
             ].filter(Boolean).join(", ")}`
           : "") +
         `\nvisible: plane 0..${planeCap}   [ / ] to change   H: hide UI\n` +
@@ -466,6 +467,12 @@ async function main(): Promise<void> {
     kind: "item",
     atlasTexture: globalAtlas.texture,
   });
+  const spotAnimPlacer = new ModelPlacer(toolHost, {
+    endpoint: "/api/spotanim",
+    meshNamePrefix: "spotanim",
+    kind: "spotanim",
+    atlasTexture: globalAtlas.texture,
+  });
   const eyedropper = new Eyedropper({
     camera,
     canvas: renderer.domElement,
@@ -475,10 +482,11 @@ async function main(): Promise<void> {
       npcPlacer.getSceneGroup(),
       objectPlacer.getSceneGroup(),
       itemPlacer.getSceneGroup(),
+      spotAnimPlacer.getSceneGroup(),
     ],
   });
 
-  const counts = { npc: 0, object: 0, item: 0 };
+  const counts = { npc: 0, object: 0, item: 0, spotanim: 0 };
   npcPlacer.onPlacementsChanged = (n) => {
     counts.npc = n;
     updateHud();
@@ -491,14 +499,24 @@ async function main(): Promise<void> {
     counts.item = n;
     updateHud();
   };
+  spotAnimPlacer.onPlacementsChanged = (n) => {
+    counts.spotanim = n;
+    updateHud();
+  };
 
-  const modelPlacers = { npc: npcPlacer, object: objectPlacer, item: itemPlacer };
+  const modelPlacers = {
+    npc: npcPlacer,
+    object: objectPlacer,
+    item: itemPlacer,
+    spotanim: spotAnimPlacer,
+  };
 
   let toolPanel!: ToolPanel;
   const forEachModelPlacer = (fn: (p: ModelPlacer) => void): void => {
     fn(npcPlacer);
     fn(objectPlacer);
     fn(itemPlacer);
+    fn(spotAnimPlacer);
   };
   /** Forward-declared so `cancelOthers` and `refreshInspectorEnabled` can
    *  see the selection. Filled in once `Selection` is constructed below.
@@ -509,10 +527,11 @@ async function main(): Promise<void> {
    *  arm something so at most one tool is hot at any given moment. Also
    *  drops any current selection — arming a placer auto-deselects so
    *  the gizmo and the placement ghost can't fight over the canvas. */
-  const cancelOthers = (keep?: "npc" | "object" | "item"): void => {
+  const cancelOthers = (keep?: "npc" | "object" | "item" | "spotanim"): void => {
     if (keep !== "npc") npcPlacer.cancel();
     if (keep !== "object") objectPlacer.cancel();
     if (keep !== "item") itemPlacer.cancel();
+    if (keep !== "spotanim") spotAnimPlacer.cancel();
     selection?.deselect();
     refreshInspectorEnabled();
   };
@@ -528,6 +547,7 @@ async function main(): Promise<void> {
       npcPlacer.isArmed() ||
       objectPlacer.isArmed() ||
       itemPlacer.isArmed() ||
+      spotAnimPlacer.isArmed() ||
       eyedropper.isArmed();
     // Also turn off the Shift-hover debug inspector while a placement is
     // selected — Shift is reserved for the gizmo's free-angle modifier
@@ -547,6 +567,7 @@ async function main(): Promise<void> {
       if (target === "npc" || target === "all") npcPlacer.clearAll();
       if (target === "object" || target === "all") objectPlacer.clearAll();
       if (target === "item" || target === "all") itemPlacer.clearAll();
+      if (target === "spotanim" || target === "all") spotAnimPlacer.clearAll();
     },
     onEyedropperArm: (armed) => {
       if (armed) {
@@ -798,8 +819,12 @@ async function main(): Promise<void> {
     // Placed NPCs cycle their idle `standingAnimation` in place. Object
     // placer has no animation today but the tick is a no-op over an
     // empty placements list, cheap enough to call unconditionally.
+    // SpotAnims are one-shot effects (cache `frameStep === -1` for
+    // most), so they play once and freeze — but we still need to tick
+    // them at least once for the frames to advance past frame 0.
     npcPlacer.tick(nowMs);
     objectPlacer.tick(nowMs);
+    spotAnimPlacer.tick(nowMs);
     skybox.update(camera.position, nowMs - startTime);
     selection.render();
     requestAnimationFrame(tick);
