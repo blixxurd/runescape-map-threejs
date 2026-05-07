@@ -35,6 +35,12 @@ export interface ModelPlacerHost {
    *  `null` when no loaded region covers (worldX, worldZ). Used by both
    *  the placer's pose-clamp and contoured-object deformation. */
   sampleTerrainAt: (worldX: number, worldZ: number, plane?: number) => number | null;
+  /** Geometry the placer should consider stackable in obey-geometry mode:
+   *  baked loc groups (per region) plus every placer's scene group, so a
+   *  freshly placed cat can sit on a freshly placed box. The placer
+   *  filters `:ghost`-named children at raycast time so its own preview
+   *  mesh doesn't shadow the surface. */
+  getGeometryObjects: () => THREE.Object3D[];
 }
 
 export interface ModelPlacerConfig {
@@ -56,6 +62,15 @@ interface CachedEntity {
    *  (0..22) the bake chose for this loc. Used by the commit-edits hook
    *  so the cache add records the right type. */
   modelType?: number;
+  /** Present only on `/api/object` responses. ObjectDefinition.sizeX/Y —
+   *  the bbox tile footprint of the loc in cache coords (1..N). The
+   *  commit-edits hook uses these to compensate for `placeLocs`'
+   *  bbox-center positioning of type 10/11 placements: a 2×1 loc clicked
+   *  at tile (a, b) ends up rendered at world `(a*128 + 128, _, -(b*128 +
+   *  64))` post-bake, so the overlay must record an `offsetX = -64` to
+   *  cancel the half-cell shift. */
+  sizeX?: number;
+  sizeY?: number;
   /** Present only on `/api/object` responses. `undefined` → rigid model.
    *  Defined (including 0) → apply contour-ground deformation. See
    *  `applyContourDeformation` for the two opcode variants. */
@@ -142,6 +157,9 @@ interface BakedResponse {
    *  so the re-extracted placement uses the SAME type the user saw —
    *  hardcoding 10 silently dropped fences/doors during re-bake. */
   modelType?: number;
+  /** Objects only — `ObjectDefinition.sizeX/sizeY`. See `CachedEntity`. */
+  sizeX?: number;
+  sizeY?: number;
   /** Objects only — present means the viewer should contour this
    *  placement's vertices against terrain. */
   contouredGround?: number;
@@ -164,6 +182,10 @@ export class ModelPlacer implements Placer {
   private readonly config: ModelPlacerConfig;
   private readonly group = new THREE.Group();
   private readonly raycaster = new THREE.Raycaster();
+  /** Separate raycaster for the down-ray that resolves Y at a snapped tile
+   *  center in obey-geometry mode. Kept distinct from `raycaster` so it
+   *  doesn't stomp the camera-derived state mid-mousemove. */
+  private readonly surfaceRaycaster = new THREE.Raycaster();
   private readonly ndc = new THREE.Vector2();
   /** Key format is `${id}:${animationOverrideOrDefault}` so the same NPC
    *  can be armed with different animations and each gets its own cached
@@ -208,6 +230,16 @@ export class ModelPlacer implements Placer {
    *  expect in an OSRS editor. */
   private snapToTile = true;
 
+  /** When `true`, the cursor + placement-Y resolution test loc geometry +
+   *  every placer's scene meshes alongside terrain. Lets users stack a
+   *  cat on a box on a table. Off by default so the simple "drop on the
+   *  ground" path stays fast and predictable. NPCs/items/spotanims live
+   *  in scene memory only, so stacking these is purely cosmetic; objects
+   *  CAN be stacked too but the on-disk overlay schema doesn't carry a Y
+   *  offset yet (see `EditsOverlayAdd`), so committed stacked objects
+   *  snap back to terrain on re-bake. */
+  private obeyGeometry = false;
+
   /** OSRS plane (0..3) the next placement will be committed to. Adjusted
    *  with `,` (down) and `.` (up) while the placer is armed. The ghost
    *  preview lifts to the chosen plane's terrain Y immediately so the user
@@ -232,13 +264,19 @@ export class ModelPlacer implements Placer {
    *  `modelType` is the OSRS placement type (0..22) the bake chose for
    *  this loc — wall (0..3), wall decor (4..8), normal scenery (10),
    *  floor decor (22). NPCs/items/spotanims pass `undefined`.
-   *  `plane` is the OSRS plane (0..3) at which to commit the placement. */
+   *  `sizeX`/`sizeY` are `ObjectDefinition.sizeX/sizeY` (1..N tile
+   *  footprint), needed by the commit-edits hook to compensate for
+   *  bbox-center positioning of multi-tile type-10/11 locs. Undefined
+   *  for non-objects. `plane` is the OSRS plane (0..3) at which to commit
+   *  the placement. */
   onPlacementSpawned:
     | ((
         mesh: THREE.Mesh,
         id: number,
         name: string,
         modelType: number | undefined,
+        sizeX: number | undefined,
+        sizeY: number | undefined,
         plane: number,
       ) => void)
     | null = null;
@@ -389,6 +427,15 @@ export class ModelPlacer implements Placer {
     this.snapToTile = enabled;
   }
 
+  /** Toggle obey-geometry. When `true`, cursor raycasts and the snapped-Y
+   *  resolver also test loc + placer geometry, so placements rest on top
+   *  of whatever they're hovering over (a cat lands on a placed box, a
+   *  torch lands on a fence top, etc.). Default `false`. */
+  setObeyGeometry(enabled: boolean): void {
+    this.obeyGeometry = enabled;
+    this.refreshGhostFromLastHit();
+  }
+
   /** Read-only — the plane the next placement will commit to. */
   getPlacementPlane(): number {
     return this.placementPlane;
@@ -464,12 +511,29 @@ export class ModelPlacer implements Placer {
   /** Move + rotate a placement. Y is re-clamped to the terrain at the new
    *  XZ when terrain is loaded under that point — placements always sit on
    *  the ground, matching how they were originally placed. Contoured
-   *  placements re-run their slope deformation against the new pose. */
-  updatePose(mesh: THREE.Mesh, position: THREE.Vector3, rotationRad: number): void {
+   *  placements re-run their slope deformation against the new pose.
+   *
+   *  `preserveY = true` skips the resample and writes `position.y` through
+   *  unchanged. Used when the gizmo's Y handle is the active drag axis so
+   *  the user's manual lift translates into a non-zero `offsetY` on the
+   *  pending edit instead of fighting the surface clamp. */
+  updatePose(
+    mesh: THREE.Mesh,
+    position: THREE.Vector3,
+    rotationRad: number,
+    preserveY = false,
+  ): void {
     const placement = this.placed.find((p) => p.mesh === mesh);
     if (!placement) return;
-    const sampledY = this.host.sampleTerrainAt(position.x, position.z, placement.plane);
-    const finalY = sampledY ?? position.y;
+    let finalY: number;
+    if (preserveY) {
+      finalY = position.y;
+    } else {
+      const sampledY = this.obeyGeometry
+        ? this.surfaceYAt(position.x, position.z)
+        : this.host.sampleTerrainAt(position.x, position.z, placement.plane);
+      finalY = sampledY ?? position.y;
+    }
     mesh.position.set(position.x, finalY, position.z);
     mesh.rotation.y = rotationRad;
     if (placement.cached.contouredGround !== undefined) {
@@ -610,7 +674,7 @@ export class ModelPlacer implements Placer {
     }
     const entity = this.armedEntity;
     if (!entity) return; // fetch still pending
-    const hit = this.raycastTerrain(e);
+    const hit = this.raycastSurface(e);
     if (!hit) {
       this.hideGhost();
       return;
@@ -662,8 +726,20 @@ export class ModelPlacer implements Placer {
     const position = this.snapToTile
       ? snapToTileCenter(worldPoint)
       : worldPoint.clone();
-    const planeY = this.host.sampleTerrainAt(position.x, position.z, this.placementPlane);
-    if (planeY !== null) position.y = planeY;
+    if (this.obeyGeometry) {
+      // Free + obey: the cursor's hit Y is already the right surface at
+      // (position.x, position.z) since XZ wasn't moved. Snap + obey:
+      // the snap shifted XZ, so re-resolve via a downward ray at the new
+      // location (the cursor might have been at the corner of a box, but
+      // the tile center sits on bare floor or on a different stack).
+      if (this.snapToTile) {
+        const y = this.surfaceYAt(position.x, position.z);
+        if (y !== null) position.y = y;
+      }
+    } else {
+      const planeY = this.host.sampleTerrainAt(position.x, position.z, this.placementPlane);
+      if (planeY !== null) position.y = planeY;
+    }
     return { position, rotationRad: (this.placementRotation * Math.PI) / 4 };
   }
 
@@ -682,7 +758,7 @@ export class ModelPlacer implements Placer {
     }
 
     if (!this.isArmed()) return;
-    const hit = this.raycastTerrain(e);
+    const hit = this.raycastSurface(e);
     if (!hit) return;
 
     const armedIdSnapshot = this.armedId!;
@@ -791,7 +867,15 @@ export class ModelPlacer implements Placer {
     }
     this.placed.push(placement);
     this.onPlacementsChanged?.(this.placed.length);
-    this.onPlacementSpawned?.(mesh, id, name, baked.modelType, this.placementPlane);
+    this.onPlacementSpawned?.(
+      mesh,
+      id,
+      name,
+      baked.modelType,
+      baked.sizeX,
+      baked.sizeY,
+      this.placementPlane,
+    );
     return placement;
   }
 
@@ -854,12 +938,44 @@ export class ModelPlacer implements Placer {
     this.removeMesh(hits[0]!.object as THREE.Mesh);
   }
 
-  private raycastTerrain(e: MouseEvent): THREE.Intersection | null {
+  /** Raycast at the cursor. Always tests terrain; in obey-geometry mode
+   *  also tests loc + placer geometry, returning the first non-ghost hit.
+   *  Skipping `:ghost`-named meshes keeps the placer's own preview from
+   *  shadowing the surface during armed-mode mousemove. */
+  private raycastSurface(e: MouseEvent): THREE.Intersection | null {
     this.updateNdc(e);
     this.raycaster.setFromCamera(this.ndc, this.host.camera);
-    const targets = this.host.getTerrainObjects();
+    const targets: THREE.Object3D[] = [...this.host.getTerrainObjects()];
+    if (this.obeyGeometry) targets.push(...this.host.getGeometryObjects());
     const hits = this.raycaster.intersectObjects(targets, true);
-    return hits[0] ?? null;
+    for (const h of hits) {
+      if (h.object.name && h.object.name.endsWith(":ghost")) continue;
+      return h;
+    }
+    return null;
+  }
+
+  /** Top-of-stack Y at world (x, z) for obey-geometry mode. Shoots a
+   *  downward ray from very high up against terrain + geometry, ignoring
+   *  the placer's own ghost. Falls back to `sampleTerrainAt` if nothing
+   *  is hit (e.g. (x, z) outside the loaded region grid, or a degenerate
+   *  geometry mesh). Off-mode callers should keep using `sampleTerrainAt`
+   *  directly — this method's overhead is wasted for plain ground placements. */
+  private surfaceYAt(x: number, z: number): number | null {
+    this.surfaceRaycaster.set(
+      new THREE.Vector3(x, 1e6, z),
+      new THREE.Vector3(0, -1, 0),
+    );
+    const targets: THREE.Object3D[] = [
+      ...this.host.getTerrainObjects(),
+      ...this.host.getGeometryObjects(),
+    ];
+    const hits = this.surfaceRaycaster.intersectObjects(targets, true);
+    for (const h of hits) {
+      if (h.object.name && h.object.name.endsWith(":ghost")) continue;
+      return h.point.y;
+    }
+    return this.host.sampleTerrainAt(x, z, this.placementPlane);
   }
 
   private updateNdc(e: MouseEvent): void {
@@ -939,6 +1055,8 @@ export class ModelPlacer implements Placer {
         geometry: geom,
         name: body.name,
         modelType: body.modelType,
+        sizeX: body.sizeX,
+        sizeY: body.sizeY,
         contouredGround: body.contouredGround,
         basePositions: positions,
         modelHeight,

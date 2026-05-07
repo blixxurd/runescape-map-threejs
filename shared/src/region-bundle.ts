@@ -34,7 +34,7 @@ export const TILE_SIZE = 128;
 export const TERRAIN_META_SCHEMA = 3 as const;
 export const TERRAIN_DEBUG_SCHEMA = 1 as const;
 export const TEXTURE_ATLAS_SCHEMA = 1 as const;
-export const LOCS_MANIFEST_SCHEMA = 8 as const;
+export const LOCS_MANIFEST_SCHEMA = 9 as const;
 export const LOCS_DEBUG_SCHEMA = 2 as const;
 
 /** Jagex region-id layout: the high byte is regionX, the low byte is regionZ. */
@@ -337,15 +337,22 @@ export interface LocPlacement {
   /**
    * Sub-tile world-unit offset added to the placement's translation when
    * rendering. Carries free-place precision from the in-viewer commit-edits
-   * editor (cache placements never set these). Both fields default to 0
-   * and are elided from the JSON when zero. Range typically ±64 (half a
-   * tile); the editor doesn't enforce a hard limit.
+   * editor (cache placements never set these). All three fields default
+   * to 0 and are elided from the JSON when zero.
    *
-   * Sign convention: world space — `offsetX` adds to `wx` (east+), `offsetZ`
-   * adds to `wz` (south+). Editor side: `offset = mesh.position - tileCenter`.
+   * Sign convention: world space — `offsetX` adds to `wx` (east+),
+   * `offsetZ` adds to `wz` (south+), `offsetY` adds to `wy` (up+). Editor
+   * side: `(offsetX, offsetZ) = mesh.position.xz - bbox-base.xz`,
+   * `offsetY = mesh.position.y - sampleTerrainAt(mesh.x, mesh.z)`.
+   *
+   * `offsetY` is what makes "obey geometry" stacks (cat on a box on a
+   * table) survive a re-bake — without it, `placeLocs` plants every
+   * placement on the terrain Y for its tile and stacks collapse to the
+   * floor on commit.
    */
   offsetX?: number;
   offsetZ?: number;
+  offsetY?: number;
   /**
    * Residual Y-axis rotation (radians) applied per-instance ON TOP of
    * the cardinal `bakedRotation` already pre-applied to the block's
@@ -514,12 +521,15 @@ export interface EditsOverlayAdd {
   /** Per-placement animation override. v1 ignores this on the extract
    *  side; reserved for future per-instance animation overrides. */
   animationOverride: number | null;
-  /** Sub-tile offset in world units (relative to the tile center). Set
-   *  by the in-viewer free-place mode so committed placements land at the
-   *  exact spot the user dropped them, not snapped to the tile centre.
-   *  Both fields default to 0; either may be omitted. */
+  /** Sub-tile offsets in world units. `offsetX/offsetZ` carry free-place
+   *  precision (relative to the bake's bbox-base position; see
+   *  `LocPlacement` for sign convention). `offsetY` carries obey-geometry
+   *  stack height — added on top of `placeLocs`' terrain-Y sample so a
+   *  placement that the user dropped on a box stays on the box after
+   *  re-bake. All three default to 0 and may be omitted. */
   offsetX?: number;
   offsetZ?: number;
+  offsetY?: number;
   /** Residual Y-axis rotation (radians) applied on top of the cardinal
    *  `rotation`. Lets the editor preserve non-cardinal placement angles
    *  (45°, 22.5°, etc.) — the cache schema only stores cardinal rotations,

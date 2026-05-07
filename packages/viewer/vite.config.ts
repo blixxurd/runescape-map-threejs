@@ -39,6 +39,7 @@ interface CommitEditsDiff {
     animationOverride: number | null;
     offsetX?: number;
     offsetZ?: number;
+    offsetY?: number;
     rotationY?: number;
   }>;
 }
@@ -579,6 +580,14 @@ function autoExtractPlugin(): Plugin {
             }
             if (a.offsetZ !== undefined && !numIn(a.offsetZ, -128, 128)) {
               writeJson(res, 400, { error: `invalid offsetZ: ${String(a.offsetZ)}` });
+              return;
+            }
+            // Y stack offset — practically bounded by how tall a stack a
+            // user is plausibly building. 4096 units = 32 tiles of stack,
+            // way past any reasonable scene editing height. Negative
+            // values let placements sink below terrain (basements, pits).
+            if (a.offsetY !== undefined && !numIn(a.offsetY, -4096, 4096)) {
+              writeJson(res, 400, { error: `invalid offsetY: ${String(a.offsetY)}` });
               return;
             }
             // Residual rotation is bounded by the cardinal decomposition's
