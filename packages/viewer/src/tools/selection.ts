@@ -142,13 +142,30 @@ export class Selection {
     this.transformControls.addEventListener("dragging-changed", (e) => {
       host.onDraggingChanged?.(Boolean((e as { value: boolean }).value));
     });
-    this.transformControls.addEventListener("change", () => {
+    // `objectChange` fires only when the gizmo actually moves the mesh
+    // (pointerMove + post-frame `update()` while dragging). The plain
+    // `change` event is noisier — it also fires when `axis` resets to
+    // `null` on pointer-up, which would re-trigger our handler with
+    // `axis === null`, flip `preserveY` to false, and yank a Y-lifted
+    // placement back to terrain at the end of the drag. Listening to
+    // `objectChange` sidesteps that.
+    this.transformControls.addEventListener("objectChange", () => {
       if (!this.current || this.current.kind !== "placed") return;
-      // Have the placer apply terrain Y-clamp + contour redeform; the
-      // mesh's position/rotation were already mutated by the gizmo, so
-      // we just feed them back through.
+      // Y-only drag bypass: while the user holds the green Y handle the
+      // gizmo's `axis` is exactly "Y" (TransformControls suppresses hover
+      // updates while `dragging === true`, so the value sticks for the
+      // whole drag). In that case skip the surface resample so the lift
+      // writes through to `offsetY` on commit. Other axes / combined
+      // drags still resample so XZ motion settles on the new tile or stack.
       const mesh = this.current.ref.mesh;
-      this.current.placer.updatePose(mesh, mesh.position, mesh.rotation.y);
+      const axis = (this.transformControls as { axis?: string | null }).axis;
+      const preserveY = axis === "Y";
+      this.current.placer.updatePose(
+        mesh,
+        mesh.position,
+        mesh.rotation.y,
+        preserveY,
+      );
       this.onPoseChanged?.(this.current);
     });
 
@@ -268,9 +285,13 @@ export class Selection {
   private applyGizmoMode(): void {
     this.transformControls.setMode(this.gizmoMode);
     if (this.gizmoMode === "translate") {
-      // XZ ground-plane only; Y is owned by the terrain sampler.
+      // All three axes available. Dragging X/Z still triggers a terrain
+      // re-clamp (placements settle on the new tile / new stack); dragging
+      // Y bypasses the clamp and writes directly to `offsetY` so the user
+      // can lift a stack manually. The bypass is implemented in the
+      // change handler below by checking `transformControls.axis`.
       this.transformControls.showX = true;
-      this.transformControls.showY = false;
+      this.transformControls.showY = true;
       this.transformControls.showZ = true;
     } else {
       // Rotate around Y only — placements stand upright.

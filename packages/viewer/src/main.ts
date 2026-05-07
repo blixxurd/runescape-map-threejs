@@ -440,12 +440,22 @@ async function main(): Promise<void> {
   // root and queries the live `regions` map via `getTerrainObjects` for
   // raycasts. The tool panel orchestrates arming across all three so only
   // one is active at a time.
+  // Placers haven't been constructed yet (toolHost is required to build
+  // them) so the obey-geometry raycast list captures placer scene groups
+  // through this array, populated below after `npcPlacer` etc. exist.
+  const obeyGeometryPlacers: ModelPlacer[] = [];
   const toolHost = {
     scene,
     camera,
     canvas: renderer.domElement,
     getTerrainObjects: () => [...regions.values()].map((r) => r.terrainGroup),
     sampleTerrainAt,
+    getGeometryObjects: (): THREE.Object3D[] => {
+      const out: THREE.Object3D[] = [];
+      for (const r of regions.values()) out.push(r.locsGroup);
+      for (const p of obeyGeometryPlacers) out.push(p.getSceneGroup());
+      return out;
+    },
   };
   // Shared global atlas for placer meshes. Kicks off in parallel with the
   // rest of main's boot — the placers are constructed in-process once it
@@ -478,6 +488,7 @@ async function main(): Promise<void> {
     kind: "spotanim",
     atlasTexture: globalAtlas.texture,
   });
+  obeyGeometryPlacers.push(npcPlacer, objectPlacer, itemPlacer, spotAnimPlacer);
   const eyedropper = new Eyedropper({
     camera,
     canvas: renderer.domElement,
@@ -594,6 +605,9 @@ async function main(): Promise<void> {
       // per (id, animId)) and the ghost updates on the next hover.
       npcPlacer.arm(npcId, name, animationId);
       refreshInspectorEnabled();
+    },
+    onObeyGeometryToggle: (obey: boolean) => {
+      forEachModelPlacer((p) => p.setObeyGeometry(obey));
     },
     onSnapToTileToggle: (snap) => {
       // Applies to every model-backed tool. TilePainter is grid-based by
@@ -727,7 +741,20 @@ async function main(): Promise<void> {
   // remove + on commit (handled in the commit handler below).
   const pendingObjectAdds = new Map<
     THREE.Mesh,
-    { regionId: number; add: EditsOverlayAdd }
+    {
+      regionId: number;
+      add: EditsOverlayAdd;
+      /** ObjectDefinition.sizeX/sizeY (1..N tile footprint) — needed by
+       *  `subOffsetForTile` to cancel `placeLocs`' bbox-center shift for
+       *  multi-tile type 10/11 locs. Both default to 1 and the offset
+       *  math reduces to plain tile-center for 1×1. */
+      sizeX: number;
+      sizeY: number;
+      /** OSRS plane the placement was committed to. Mirrors `add.plane`
+       *  for the lifetime of the tracked add — kept here so onPlacementUpdated
+       *  can pass the right plane to `subOffsetForTile`'s terrain sample. */
+      plane: number;
+    }
   >();
 
   /** World (x, z) → (regionId, region-local tileX, tileZ). Returns null
@@ -790,25 +817,62 @@ async function main(): Promise<void> {
    *  to keep overlays clean. ~0.4% of a tile. */
   const SUB_OFFSET_EPSILON = 0.5;
 
-  /** Compute the sub-tile world-space offset from a mesh position to its
-   *  containing tile's center. World axes: +X east, +Z south. Cache axes:
-   *  tile center at (tileX*128 + 64, _, -(tileZ*128 + 64)) in world. */
+  /** Sub-tile world-space offset from a mesh position to the world-space
+   *  position the extractor's `placeLocs` will produce after re-bake.
+   *  For 1×1 locs (sizeX=sizeY=1) and non-bbox-centered types (walls 0..3,
+   *  wall decor 4..8, floor decor 22), that's just the tile center. For
+   *  multi-tile type 10/11 placements `placeLocs` shifts the world position
+   *  to the bbox CENTER (`tileX*128 + sizeX*64`), so `offsetX` here has to
+   *  cancel the half-cell extras: a 2×1 loc clicked at tile (a, b) wants
+   *  to render at world `(a*128 + 64, _, -(b*128 + 64))`, but bake produces
+   *  `(a*128 + 128, _, -(b*128 + 64))` — recording `offsetX = -64`
+   *  brings them back into agreement.
+   *
+   *  Bbox-rotated case: `placeLocs` swaps sizeX/sizeY when origRotation is
+   *  1 or 3, so we must use the SAME swap here, keyed off the cardinal we
+   *  just decomposed. Otherwise a rotated 2×1 loc commits with the wrong
+   *  axis offset (the "Z is off after commit" bug from the in-session
+   *  test). World axes: +X east, +Z south.  */
   const subOffsetForTile = (
     mesh: THREE.Mesh,
     tileX: number,
     tileZ: number,
-  ): { offsetX?: number; offsetZ?: number } => {
-    const tileCenterX = tileX * TILE_SIZE + TILE_SIZE / 2;
-    const tileCenterZ = -(tileZ * TILE_SIZE + TILE_SIZE / 2);
-    const offsetX = mesh.position.x - tileCenterX;
-    const offsetZ = mesh.position.z - tileCenterZ;
+    type: number,
+    cardinal: number,
+    sizeX: number,
+    sizeY: number,
+    plane: number,
+  ): { offsetX?: number; offsetZ?: number; offsetY?: number } => {
+    const isBoundingBoxed = type === 10 || type === 11;
+    let effSX = sizeX;
+    let effSY = sizeY;
+    if (isBoundingBoxed && (cardinal === 1 || cardinal === 3)) {
+      effSX = sizeY;
+      effSY = sizeX;
+    }
+    const offsetCellsX = isBoundingBoxed ? effSX : 1;
+    const offsetCellsY = isBoundingBoxed ? effSY : 1;
+    const bakeBaseX = tileX * TILE_SIZE + (offsetCellsX * TILE_SIZE) / 2;
+    const bakeBaseZ = -(tileZ * TILE_SIZE + (offsetCellsY * TILE_SIZE) / 2);
+    const offsetX = mesh.position.x - bakeBaseX;
+    const offsetZ = mesh.position.z - bakeBaseZ;
+    // Y offset = how far the mesh sits above the terrain Y at its tile.
+    // Zero for plain ground placements (mesh.y was clamped to terrain by
+    // the placer). Non-zero when obey-geometry stacked the placement on
+    // another loc — `placeLocs` re-applies this on top of the terrain
+    // sample so the stack survives re-bake. Sample at the bake-base XZ
+    // (not mesh.position.xz) so the reference matches `placeLocs`'
+    // sampling site exactly.
+    const terrainY = sampleTerrainAt(bakeBaseX, bakeBaseZ, plane);
+    const offsetY = terrainY !== null ? mesh.position.y - terrainY : 0;
     return {
       ...(Math.abs(offsetX) >= SUB_OFFSET_EPSILON ? { offsetX } : {}),
       ...(Math.abs(offsetZ) >= SUB_OFFSET_EPSILON ? { offsetZ } : {}),
+      ...(Math.abs(offsetY) >= SUB_OFFSET_EPSILON ? { offsetY } : {}),
     };
   };
 
-  objectPlacer.onPlacementSpawned = (mesh, id, _name, modelType, plane) => {
+  objectPlacer.onPlacementSpawned = (mesh, id, _name, modelType, sizeX, sizeY, plane) => {
     const tile = worldToTile(mesh.position.x, mesh.position.z);
     if (!tile) {
       console.warn(`[commit] object spawn at (${mesh.position.x}, ${mesh.position.z}) outside loaded grid; not tracking`);
@@ -819,19 +883,28 @@ async function main(): Promise<void> {
     // (4..8), and floor decor (22) all need their native type — hardcoded
     // 10 made fences (type 0) silently vanish on re-bake.
     const { cardinal, residual } = decomposeRotation(mesh.rotation.y);
+    const type = modelType ?? 10;
+    const sX = sizeX ?? 1;
+    const sY = sizeY ?? 1;
     const add: EditsOverlayAdd = {
       locId: id,
       plane,
       tileX: tile.tileX,
       tileZ: tile.tileZ,
-      type: modelType ?? 10,
+      type,
       rotation: cardinal,
       animationOverride: null,
-      ...subOffsetForTile(mesh, tile.tileX, tile.tileZ),
+      ...subOffsetForTile(mesh, tile.tileX, tile.tileZ, type, cardinal, sX, sY, plane),
       ...(Math.abs(residual) > 1e-4 ? { rotationY: residual } : {}),
     };
     pendingEdits.addAdd(tile.regionId, add);
-    pendingObjectAdds.set(mesh, { regionId: tile.regionId, add });
+    pendingObjectAdds.set(mesh, {
+      regionId: tile.regionId,
+      add,
+      sizeX: sX,
+      sizeY: sY,
+      plane,
+    });
   };
 
   objectPlacer.onPlacementUpdated = (mesh) => {
@@ -855,11 +928,22 @@ async function main(): Promise<void> {
     // Recompute sub-tile offset on every drag so the committed value
     // tracks the latest cursor position. Below-epsilon offsets get
     // dropped to keep overlays clean.
-    const sub = subOffsetForTile(mesh, tile.tileX, tile.tileZ);
+    const sub = subOffsetForTile(
+      mesh,
+      tile.tileX,
+      tile.tileZ,
+      tracked.add.type,
+      cardinal,
+      tracked.sizeX,
+      tracked.sizeY,
+      tracked.plane,
+    );
     if (sub.offsetX !== undefined) tracked.add.offsetX = sub.offsetX;
     else delete tracked.add.offsetX;
     if (sub.offsetZ !== undefined) tracked.add.offsetZ = sub.offsetZ;
     else delete tracked.add.offsetZ;
+    if (sub.offsetY !== undefined) tracked.add.offsetY = sub.offsetY;
+    else delete tracked.add.offsetY;
     pendingEdits.notifyChange();
   };
 

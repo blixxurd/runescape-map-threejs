@@ -276,7 +276,12 @@ export function placeLocs(
     // Polygon offset on the loc material is the *correct* fix in
     // theory, but its sub-pixel bias isn't reliable across all GPUs;
     // a real offset always works.
-    const wy = sampleTerrain(p.plane, wx, -wz) + LOC_TERRAIN_LIFT;
+    // Stack offset: obey-geometry placements (cat on box, etc.) record
+    // the height above terrain at their tile, applied here after the
+    // terrain sample so the placement re-renders at the same world Y on
+    // every re-bake.
+    let wy = sampleTerrain(p.plane, wx, -wz) + LOC_TERRAIN_LIFT;
+    if (p.offsetY) wy += p.offsetY;
     return { wx, wy, wz };
   };
 

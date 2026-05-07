@@ -1224,9 +1224,12 @@ export function emitLocs(
     localY: number;
     plane: number;
     /** Optional sub-tile world-unit offset. Cache placements never set
-     *  these; overlay adds pass them through from the free-place editor. */
+     *  these; overlay adds pass them through from the free-place / obey-
+     *  geometry editor. `offsetY` lifts the placement off the terrain Y
+     *  baseline (e.g. cat-on-box stacks). */
     offsetX?: number;
     offsetZ?: number;
+    offsetY?: number;
     /** Optional non-cardinal residual rotation (radians) applied on top
      *  of the cardinal `rotation` for free-rotation editor adds. */
     rotationY?: number;
@@ -1255,6 +1258,7 @@ export function emitLocs(
         plane: a.plane,
         ...(a.offsetX !== undefined && a.offsetX !== 0 ? { offsetX: a.offsetX } : {}),
         ...(a.offsetZ !== undefined && a.offsetZ !== 0 ? { offsetZ: a.offsetZ } : {}),
+        ...(a.offsetY !== undefined && a.offsetY !== 0 ? { offsetY: a.offsetY } : {}),
         ...(a.rotationY !== undefined && a.rotationY !== 0 ? { rotationY: a.rotationY } : {}),
       });
     }
@@ -1346,6 +1350,7 @@ export function emitLocs(
         blockedEdges,
         ...(rec.offsetX !== undefined && rec.offsetX !== 0 ? { offsetX: rec.offsetX } : {}),
         ...(rec.offsetZ !== undefined && rec.offsetZ !== 0 ? { offsetZ: rec.offsetZ } : {}),
+        ...(rec.offsetY !== undefined && rec.offsetY !== 0 ? { offsetY: rec.offsetY } : {}),
         ...(rec.rotationY !== undefined && rec.rotationY !== 0 ? { rotationY: rec.rotationY } : {}),
       });
       placementIdsList.push(hashUint);

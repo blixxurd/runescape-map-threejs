@@ -52,10 +52,16 @@ export interface Placer {
   getSceneGroup(): THREE.Group;
   /** Snapshot of current placements; cheap to call. */
   getPlacements(): PlacedRef[];
-  /** Move + rotate a placement. Y is re-clamped to terrain at the new XZ
-   *  by the placer (selection passes the desired XZ in `position.y` is
-   *  ignored when terrain sampling succeeds). */
-  updatePose(mesh: THREE.Mesh, position: THREE.Vector3, rotationRad: number): void;
+  /** Move + rotate a placement. By default Y is re-clamped to the surface
+   *  at the new XZ. Pass `preserveY = true` to keep `position.y` exactly
+   *  (used when the gizmo's Y handle is the active drag axis so the
+   *  user's manual lift writes through to `offsetY` on commit). */
+  updatePose(
+    mesh: THREE.Mesh,
+    position: THREE.Vector3,
+    rotationRad: number,
+    preserveY?: boolean,
+  ): void;
   /** Remove a placement by mesh reference. */
   removeMesh(mesh: THREE.Mesh): void;
   /** Clone a placement at the same pose. */

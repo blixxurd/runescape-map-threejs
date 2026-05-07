@@ -41,6 +41,10 @@ export interface ToolPanelHost {
    *  tile centers (the default); `true` drops the snap and lets users
    *  place anywhere the cursor lands. */
   onSnapToTileToggle(snap: boolean): void;
+  /** User toggled "obey geometry" — when on, placements rest on top of
+   *  loc geometry / other placements instead of going through them to the
+   *  ground. Independent of snap mode (combine freely). */
+  onObeyGeometryToggle(obey: boolean): void;
   /** User clicked the screenshot button (or pressed P). */
   onScreenshot(): void;
   /** User clicked the commit button to bake pending session edits into
@@ -183,6 +187,7 @@ export class ToolPanel {
   private readonly tabBtns: Record<ModelTab, HTMLButtonElement>;
   private readonly eyedropperBtn: HTMLButtonElement;
   private readonly freePlaceBtn: HTMLButtonElement;
+  private readonly obeyGeomBtn: HTMLButtonElement;
   private readonly commitBtn: HTMLButtonElement;
 
   private activeTab: ModelTab = "npc";
@@ -208,6 +213,9 @@ export class ToolPanel {
           </button>
           <button class="head-btn free-place" type="button" title="free placement — ignore tile snap">
             free
+          </button>
+          <button class="head-btn obey-geom" type="button" title="obey geometry — placements rest on top of objects, not just terrain">
+            stack
           </button>
           <button class="head-btn eyedropper" type="button" title="pick from world (I)">
             pick
@@ -302,6 +310,7 @@ export class ToolPanel {
     };
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
+    this.obeyGeomBtn = this.root.querySelector<HTMLButtonElement>(".obey-geom")!;
     this.commitBtn = this.root.querySelector<HTMLButtonElement>(".commit")!;
     this.commitBtn.addEventListener("click", () => {
       if (!this.commitBtn.disabled) this.host.onCommit();
@@ -356,6 +365,12 @@ export class ToolPanel {
       this.freePlaceBtn.classList.toggle("active", willFree);
       // When active we're in free-place mode → snap is OFF.
       this.host.onSnapToTileToggle(!willFree);
+    });
+
+    this.obeyGeomBtn.addEventListener("click", () => {
+      const willObey = !this.obeyGeomBtn.classList.contains("active");
+      this.obeyGeomBtn.classList.toggle("active", willObey);
+      this.host.onObeyGeometryToggle(willObey);
     });
   }
 
