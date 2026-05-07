@@ -15,6 +15,7 @@ import type {
   buildSpotAnimCatalog as BuildSpotAnimCatalogFn,
   buildSequenceCatalog as BuildSequenceCatalogFn,
   buildGlobalAtlas as BuildGlobalAtlasFn,
+  mergeAndSaveEdits as MergeAndSaveEditsFn,
   BakedAtlas,
   NpcCatalogEntry,
   ObjectCatalogEntry,
@@ -23,6 +24,24 @@ import type {
   SequenceCatalogEntry,
 } from "@rsmap/extractor";
 import { defineConfig } from "vite";
+
+/** Wire-format diff sent from the viewer's commit button. Shape mirrors
+ *  `EditsOverlay` minus the schemaVersion — server applies that. */
+interface CommitEditsDiff {
+  removes: string[];
+  adds: Array<{
+    locId: number;
+    plane: number;
+    tileX: number;
+    tileZ: number;
+    type: number;
+    rotation: number;
+    animationOverride: number | null;
+    offsetX?: number;
+    offsetZ?: number;
+    rotationY?: number;
+  }>;
+}
 
 /**
  * Dev middleware — let the viewer trigger a region extraction when its
@@ -54,6 +73,7 @@ function autoExtractPlugin(): Plugin {
     buildSpotAnimCatalog: typeof BuildSpotAnimCatalogFn;
     buildSequenceCatalog: typeof BuildSequenceCatalogFn;
     buildGlobalAtlas: typeof BuildGlobalAtlasFn;
+    mergeAndSaveEdits: typeof MergeAndSaveEditsFn;
   }
 
   let extractorModule: ExtractorModule | null = null;
@@ -123,6 +143,74 @@ function autoExtractPlugin(): Plugin {
     res.statusCode = status;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify(body));
+  }
+
+  /** Read the request body as JSON. Caps payload at 1 MB so a runaway
+   *  client can't blow up the dev server. Anything larger is a bug. */
+  async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+    return new Promise((resolveBody, rejectBody) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      req.on("data", (c: Buffer) => {
+        total += c.length;
+        if (total > 1024 * 1024) {
+          rejectBody(new Error("body too large (>1 MB)"));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on("end", () => {
+        try {
+          resolveBody(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        } catch (e) {
+          rejectBody(e);
+        }
+      });
+      req.on("error", rejectBody);
+    });
+  }
+
+  /** Per-region commit mutex. Serialises commit-edit operations for the
+   *  same region so two rapid commits can't interleave save+extract steps.
+   *  Concurrent commits to *different* regions still run in parallel —
+   *  they only serialise behind `queueTail` inside `enqueueExtract`. */
+  const commitMutex = new Map<number, Promise<unknown>>();
+
+  /**
+   * Apply a commit-edits diff to a region's overlay file and re-bake the
+   * bundle. Coordinates three kinds of work that mustn't interleave:
+   *
+   *   1. Any in-flight extract for this region (started by a neighbour
+   *      streaming pass or a stale viewer fetch) must finish first —
+   *      otherwise that extract reads the previous overlay state and
+   *      writes a bundle that doesn't reflect our edit.
+   *   2. Save the merged overlay to disk.
+   *   3. Enqueue a fresh extract; await it so the HTTP response only goes
+   *      out once the bundle is written.
+   */
+  async function commitEditsForRegion(
+    server: ViteDevServer,
+    regionId: number,
+    diff: CommitEditsDiff,
+  ): Promise<void> {
+    const mod = await loadModule(server);
+    const prev = commitMutex.get(regionId) ?? Promise.resolve();
+    const job = prev.then(async () => {
+      // Drain any extract that started before us — its overlay snapshot is
+      // stale by definition, so we wait it out instead of letting it stomp
+      // our bundle.
+      const inflightExtract = inflight.get(regionId);
+      if (inflightExtract) await inflightExtract.catch(() => undefined);
+      await mod.mergeAndSaveEdits(regionId, diff);
+      await enqueueExtract(server, regionId);
+    });
+    // Don't poison future commits if this one fails.
+    commitMutex.set(
+      regionId,
+      job.catch(() => undefined),
+    );
+    await job;
   }
 
   async function getNpcCatalog(server: ViteDevServer): Promise<NpcCatalogEntry[]> {
@@ -391,6 +479,130 @@ function autoExtractPlugin(): Plugin {
             }
             server.config.logger.error(
               `[auto-extract] region ${regionId} failed: ${(err as Error).message}`,
+            );
+            writeJson(res, 500, { error: (err as Error).message, regionId });
+          }
+          return;
+        }
+
+        if (
+          req.url === "/api/dev/commit-edits" ||
+          req.url.startsWith("/api/dev/commit-edits?")
+        ) {
+          if (req.method !== "POST") {
+            writeJson(res, 405, { error: "POST required" });
+            return;
+          }
+          const url = new URL(req.url, "http://localhost");
+          const regionParam = url.searchParams.get("region");
+          const regionId = Number(regionParam);
+          if (!Number.isInteger(regionId) || regionId < 0 || regionId > 0xffff) {
+            writeJson(res, 400, { error: `invalid region id: ${regionParam}` });
+            return;
+          }
+
+          let raw: unknown;
+          try {
+            raw = await readJsonBody(req);
+          } catch (e) {
+            writeJson(res, 400, { error: `invalid body: ${(e as Error).message}` });
+            return;
+          }
+          const body = raw as Partial<CommitEditsDiff> | null;
+          if (!body || typeof body !== "object") {
+            writeJson(res, 400, { error: "expected JSON object body" });
+            return;
+          }
+          const removes = Array.isArray(body.removes) ? body.removes : [];
+          const adds = Array.isArray(body.adds) ? body.adds : [];
+
+          // Validate `removes` are 8-char hex placement IDs.
+          for (const h of removes) {
+            if (typeof h !== "string" || !/^[0-9a-f]{8}$/.test(h)) {
+              writeJson(res, 400, { error: `invalid placement id: ${String(h)}` });
+              return;
+            }
+          }
+          // Validate `adds` field-by-field. We deliberately DON'T check
+          // locId against the object catalog — the catalog filters out
+          // entries with `name === "null"`, but the eyedropper + placer
+          // happily round-trip those ids (any baked-loc you can click
+          // is a valid id). The extractor logs `noDef` for genuine
+          // typos, which is enough surface area.
+          const intIn = (v: unknown, lo: number, hi: number): boolean =>
+            typeof v === "number" && Number.isInteger(v) && v >= lo && v <= hi;
+          for (const a of adds) {
+            if (!a || typeof a !== "object") {
+              writeJson(res, 400, { error: "add must be an object" });
+              return;
+            }
+            if (!intIn(a.locId, 0, 0xfffff)) {
+              writeJson(res, 400, { error: `invalid locId: ${String(a.locId)}` });
+              return;
+            }
+            if (!intIn(a.plane, 0, 3)) {
+              writeJson(res, 400, { error: `invalid plane: ${String(a.plane)}` });
+              return;
+            }
+            if (!intIn(a.tileX, 0, 63) || !intIn(a.tileZ, 0, 63)) {
+              writeJson(res, 400, {
+                error: `invalid tile coords: ${String(a.tileX)},${String(a.tileZ)}`,
+              });
+              return;
+            }
+            if (!intIn(a.type, 0, 22)) {
+              writeJson(res, 400, { error: `invalid type: ${String(a.type)}` });
+              return;
+            }
+            if (!intIn(a.rotation, 0, 3)) {
+              writeJson(res, 400, { error: `invalid rotation: ${String(a.rotation)}` });
+              return;
+            }
+            if (
+              a.animationOverride !== null &&
+              !intIn(a.animationOverride, 0, 0xffffff)
+            ) {
+              writeJson(res, 400, {
+                error: `invalid animationOverride: ${String(a.animationOverride)}`,
+              });
+              return;
+            }
+            // Sub-tile offsets are world-unit fractions; allow up to one
+            // full tile in either direction (placer-side shouldn't ever
+            // exceed half a tile, but be lenient in case someone hand-
+            // edits the overlay).
+            const numIn = (v: unknown, lo: number, hi: number): boolean =>
+              typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+            if (a.offsetX !== undefined && !numIn(a.offsetX, -128, 128)) {
+              writeJson(res, 400, { error: `invalid offsetX: ${String(a.offsetX)}` });
+              return;
+            }
+            if (a.offsetZ !== undefined && !numIn(a.offsetZ, -128, 128)) {
+              writeJson(res, 400, { error: `invalid offsetZ: ${String(a.offsetZ)}` });
+              return;
+            }
+            // Residual rotation is bounded by the cardinal decomposition's
+            // range (−π/4..π/4]. Be lenient — accept the full circle in
+            // case a hand-edit happens to record an un-normalised value.
+            const TWO_PI = Math.PI * 2;
+            if (a.rotationY !== undefined && !numIn(a.rotationY, -TWO_PI, TWO_PI)) {
+              writeJson(res, 400, { error: `invalid rotationY: ${String(a.rotationY)}` });
+              return;
+            }
+          }
+
+          try {
+            server.config.logger.info(
+              `[commit-edits] region ${regionId}: ${removes.length} removes, ${adds.length} adds`,
+            );
+            await commitEditsForRegion(server, regionId, {
+              removes,
+              adds: adds as CommitEditsDiff["adds"],
+            });
+            writeJson(res, 200, { ok: true, regionId });
+          } catch (err) {
+            server.config.logger.error(
+              `[commit-edits] region ${regionId} failed: ${(err as Error).message}`,
             );
             writeJson(res, 500, { error: (err as Error).message, regionId });
           }

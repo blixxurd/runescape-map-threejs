@@ -43,6 +43,10 @@ export interface ToolPanelHost {
   onSnapToTileToggle(snap: boolean): void;
   /** User clicked the screenshot button (or pressed P). */
   onScreenshot(): void;
+  /** User clicked the commit button to bake pending session edits into
+   *  the on-disk overlay + re-extract affected regions. Only enabled
+   *  when the pendingEdits store reports at least one change. */
+  onCommit(): void;
 }
 
 type AnyCatalog = NpcCatalogEntry[] | ObjectCatalogEntry[] | ItemCatalogEntry[] | SpotAnimCatalogEntry[];
@@ -82,6 +86,18 @@ function injectStyles(): void {
     #toolPanel .head button.head-btn:hover { color: #e6e8ec; border-color: #7aa6d6; }
     #toolPanel .head button.head-btn.active {
       background: #2d4b2d; color: #e8f5e8; border-color: #4c6b4c;
+    }
+    #toolPanel .head button.head-btn.commit {
+      background: #2a3a4a; color: #aac6e0; border-color: #3a4a60;
+    }
+    #toolPanel .head button.head-btn.commit:hover:not(:disabled) {
+      background: #3a5060; color: #e6f0fa; border-color: #5fdcff;
+    }
+    #toolPanel .head button.head-btn.commit:disabled {
+      opacity: 0.45; cursor: default; color: #5a6478;
+    }
+    #toolPanel .head button.head-btn.commit.busy {
+      background: #3a3a2a; color: #e0d8aa; border-color: #5a5a40;
     }
     #toolPanel .head .collapse {
       background: transparent; border: none; color: #8f9bb5;
@@ -167,6 +183,7 @@ export class ToolPanel {
   private readonly tabBtns: Record<ModelTab, HTMLButtonElement>;
   private readonly eyedropperBtn: HTMLButtonElement;
   private readonly freePlaceBtn: HTMLButtonElement;
+  private readonly commitBtn: HTMLButtonElement;
 
   private activeTab: ModelTab = "npc";
   private readonly tabStates: Record<ModelTab, TabState> = {
@@ -186,6 +203,9 @@ export class ToolPanel {
       <div class="head">
         <span class="title">editor</span>
         <div class="head-actions">
+          <button class="head-btn commit" type="button" title="commit pending edits to bundle" disabled>
+            commit
+          </button>
           <button class="head-btn free-place" type="button" title="free placement — ignore tile snap">
             free
           </button>
@@ -282,6 +302,10 @@ export class ToolPanel {
     };
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
+    this.commitBtn = this.root.querySelector<HTMLButtonElement>(".commit")!;
+    this.commitBtn.addEventListener("click", () => {
+      if (!this.commitBtn.disabled) this.host.onCommit();
+    });
     this.root
       .querySelector<HTMLButtonElement>(".screenshot")!
       .addEventListener("click", () => this.host.onScreenshot());
@@ -339,6 +363,27 @@ export class ToolPanel {
    *  or keyboard shortcut). Keeps the button visually in sync. */
   setEyedropperArmed(armed: boolean): void {
     this.eyedropperBtn.classList.toggle("active", armed);
+  }
+
+  /** Host calls this whenever pendingEdits changes — passes the count of
+   *  pending changes (or null while a commit is in flight). The button
+   *  enables on count > 0, shows a "(N)" badge, and goes "busy" while a
+   *  commit POST is running. */
+  setCommitState(opts: { pending: number; busy: boolean }): void {
+    if (opts.busy) {
+      this.commitBtn.disabled = true;
+      this.commitBtn.classList.add("busy");
+      this.commitBtn.textContent = "committing…";
+      return;
+    }
+    this.commitBtn.classList.remove("busy");
+    if (opts.pending === 0) {
+      this.commitBtn.disabled = true;
+      this.commitBtn.textContent = "commit";
+    } else {
+      this.commitBtn.disabled = false;
+      this.commitBtn.textContent = `commit (${opts.pending})`;
+    }
   }
 
   /** Host calls this after the eyedropper resolves a pick and arms the

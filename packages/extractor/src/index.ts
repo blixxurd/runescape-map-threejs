@@ -16,6 +16,14 @@ import {
   emitLocs,
   writeLocsBundle,
 } from "./region/locs.js";
+import { loadEdits } from "./region/edits.js";
+export {
+  loadEdits,
+  saveEdits,
+  mergeAndSaveEdits,
+  placementHash,
+  EDITS_DIR,
+} from "./region/edits.js";
 import { buildAtlas, writeAtlas } from "./texture/atlas.js";
 import { patchObjectLoader, getObjectLoaderFailureCount } from "./patches/objectLoader.js";
 import { patchFloorLoaders } from "./patches/floorLoaders.js";
@@ -137,6 +145,18 @@ export async function extractRegion(
   const outDir = join(VIEWER_REGIONS, String(regionId));
   mkdirSync(outDir, { recursive: true });
 
+  // Read the in-viewer commit-edits overlay, if any. Re-read on every call —
+  // the dev-server's `/api/dev/commit-edits` endpoint writes the overlay
+  // and immediately re-runs this function, so a memoized result would
+  // silently stale-bake.
+  const overlay = await loadEdits(regionId);
+  if (overlay) {
+    console.log(
+      `[extract] applying overlay for region ${regionId}: ` +
+        `${overlay.removes.length} removes, ${overlay.adds.length} adds`,
+    );
+  }
+
   // Phase 1: resolve both pipelines in parallel (they don't yet know atlas).
   // prepareTerrain is what reports a missing region; translate the generic
   // Error into the tagged class so the middleware can answer 404.
@@ -147,7 +167,7 @@ export async function extractRegion(
         buildId: session.cacheMeta.build,
         sourceCacheId: session.cacheMeta.id,
       }),
-      prepareLocs(session.rs, regionX, regionZ),
+      prepareLocs(session.rs, regionX, regionZ, overlay?.adds),
     ]);
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("No map data for region")) {
@@ -172,7 +192,7 @@ export async function extractRegion(
   // geometry extends past the region edge into a neighbor.
   const terrain = emitTerrain(terrainPlan, atlas);
   await writeTerrainBundle(terrain, outDir);
-  const locs = emitLocs(locsPlan, atlas, terrainPlan.sceneHeights);
+  const locs = emitLocs(locsPlan, atlas, terrainPlan.sceneHeights, overlay);
   await writeLocsBundle(locs, outDir);
 
   const failures = getObjectLoaderFailureCount();

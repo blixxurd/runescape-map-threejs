@@ -1,6 +1,7 @@
 import * as THREE from "three";
-import type { Selection, GizmoMode } from "./selection.js";
+import type { Selection, GizmoMode, SelectionInfo } from "./selection.js";
 import type { PlacedRef } from "./placerTypes.js";
+import type { LocHit } from "./locResolve.js";
 
 /**
  * Floating, draggable inspector for the currently-selected placement.
@@ -69,6 +70,11 @@ function injectStyles(): void {
     }
     #inspectorPanel input[type="number"]:focus,
     #inspectorPanel select:focus { border-color: #5fdcff; }
+    #inspectorPanel .row .ro {
+      flex: 1; color: #d5dce8; padding: 3px 6px;
+      background: #10131d; border: 1px solid #1f2638; border-radius: 3px;
+      font-variant-numeric: tabular-nums;
+    }
     #inspectorPanel .step-btns {
       display: flex; gap: 4px;
     }
@@ -139,16 +145,22 @@ export class InspectorPanel {
   /** Subscriber-style entry points called from main's wiring layer. The
    *  panel is a passive view — main fans `Selection.onXxx` events out to
    *  these methods so other listeners (HUD gating) stay in the loop. */
-  handleSelectionChanged(info: { ref: PlacedRef } | null): void {
+  handleSelectionChanged(info: SelectionInfo | null): void {
     if (!info) {
       this.root.classList.remove("visible");
       return;
     }
-    this.render(info.ref);
+    if (info.kind === "placed") {
+      this.renderPlaced(info.ref);
+    } else {
+      this.renderBaked(info.regionId, info.locHit);
+    }
     this.root.classList.add("visible");
   }
 
-  handlePoseChanged(info: { ref: PlacedRef }): void {
+  handlePoseChanged(info: SelectionInfo): void {
+    // Only placed-selection poses change live (baked has no gizmo).
+    if (info.kind !== "placed") return;
     this.updateFromPose(info.ref);
   }
 
@@ -156,7 +168,7 @@ export class InspectorPanel {
     this.applyModeButtons(mode);
   }
 
-  private render(ref: PlacedRef): void {
+  private renderPlaced(ref: PlacedRef): void {
     const { mesh } = ref;
     const titleEl = this.head.querySelector<HTMLSpanElement>(".title")!;
     titleEl.textContent = `${kindLabel(ref.kind)}: ${stripOsrsTags(ref.name)}`;
@@ -258,7 +270,7 @@ export class InspectorPanel {
         const animId = Number(select.value);
         if (!Number.isFinite(animId)) return;
         const sel = this.host.selection.getSelected();
-        if (!sel || !sel.placer.swapAnimation) return;
+        if (!sel || sel.kind !== "placed" || !sel.placer.swapAnimation) return;
         void sel.placer.swapAnimation(sel.ref.mesh, animId).then(() => {
           this.host.selection.refresh();
         });
@@ -278,17 +290,14 @@ export class InspectorPanel {
     dupBtn.title = "duplicate at same pose (cmd/ctrl+D)";
     dupBtn.addEventListener("click", () => {
       const sel = this.host.selection.getSelected();
-      if (sel) sel.placer.duplicate(sel.ref.mesh);
+      if (sel?.kind === "placed") sel.placer.duplicate(sel.ref.mesh);
     });
     const delBtn = document.createElement("button");
     delBtn.className = "action danger";
     delBtn.type = "button";
     delBtn.textContent = "delete";
     delBtn.title = "delete (delete / backspace)";
-    delBtn.addEventListener("click", () => {
-      const sel = this.host.selection.getSelected();
-      if (sel) sel.placer.removeMesh(sel.ref.mesh);
-    });
+    delBtn.addEventListener("click", () => this.host.selection.deleteSelection());
     actions.appendChild(dupBtn);
     actions.appendChild(delBtn);
     this.body.appendChild(actions);
@@ -331,7 +340,7 @@ export class InspectorPanel {
    *  current mesh value. */
   private applyPose(patch: { x?: number; z?: number; rotationRad?: number }): void {
     const sel = this.host.selection.getSelected();
-    if (!sel) return;
+    if (!sel || sel.kind !== "placed") return;
     const mesh = sel.ref.mesh;
     const next = new THREE.Vector3(
       patch.x ?? mesh.position.x,
@@ -344,7 +353,7 @@ export class InspectorPanel {
 
   private stepRotation(delta: number): void {
     const sel = this.host.selection.getSelected();
-    if (!sel) return;
+    if (!sel || sel.kind !== "placed") return;
     const mesh = sel.ref.mesh;
     // Snap the post-step value to the nearest 45° so chained steps stay
     // tidy even if the user free-angled mid-edit. Without the snap, a
@@ -352,6 +361,87 @@ export class InspectorPanel {
     const snapped = Math.round((mesh.rotation.y + delta) / (Math.PI / 4)) * (Math.PI / 4);
     sel.placer.updatePose(mesh, mesh.position, snapped);
     if (this.rotInput) this.rotInput.value = String(Math.round(radToDeg(snapped)));
+  }
+
+  /**
+   * Read-only inspector for a baked-loc selection. v1 supports Delete only —
+   * the placement gets tombstoned in `pendingEdits` so the next "commit"
+   * removes it from the bundle. Editing position/rotation isn't wired up
+   * (v1 scope: delete-baked + add-fresh, no baked-loc moves). Use the
+   * Object placer to add a fresh placement at the new location instead.
+   */
+  private renderBaked(regionId: number, locHit: LocHit): void {
+    const titleEl = this.head.querySelector<HTMLSpanElement>(".title")!;
+    const placement = locHit.placement;
+    titleEl.textContent = `baked loc #${locHit.locId}`;
+    titleEl.title = `baked loc ${locHit.locId} in region ${regionId}`;
+
+    this.head.querySelector(".id-tag")?.remove();
+    const idTag = document.createElement("span");
+    idTag.className = "id-tag";
+    idTag.textContent = `region ${regionId}`;
+    titleEl.after(idTag);
+
+    this.body.innerHTML = "";
+
+    // Read-only summary rows.
+    const lines: Array<[string, string]> = [
+      ["plane", String(placement.plane)],
+      ["tile", `(${placement.x}, ${placement.z})`],
+      ["type", String(placement.origType)],
+      ["rot", `${placement.origRotation} (${placement.origRotation * 90}°)`],
+    ];
+    if (locHit.placementIdHex !== null) {
+      lines.push(["id", locHit.placementIdHex]);
+    }
+    for (const [label, value] of lines) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<label>${label}</label><span class="ro">${value}</span>`;
+      this.body.appendChild(row);
+    }
+
+    if (locHit.instancedSiblingCount > 1) {
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.innerHTML =
+        `<b>1 of ${locHit.instancedSiblingCount}</b> identical placements share ` +
+        `this InstancedMesh. The outline is a known v1 limitation; deletion ` +
+        `still targets exactly the clicked instance.`;
+      this.body.appendChild(note);
+    }
+
+    // Delete: tombstones the placement via the pending-edits store.
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const delBtn = document.createElement("button");
+    delBtn.className = "action danger";
+    delBtn.type = "button";
+    delBtn.textContent = "delete";
+    delBtn.title = "tombstone for next commit (delete / backspace)";
+    if (locHit.placementIdHex === null) {
+      delBtn.disabled = true;
+      delBtn.title = "this bundle has no placementIds — re-extract to enable";
+    }
+    delBtn.addEventListener("click", () => this.host.selection.deleteSelection());
+    actions.appendChild(delBtn);
+    this.body.appendChild(actions);
+
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.innerHTML =
+      `Edits stay in-session until you click <b>commit</b>. ` +
+      `Reload without committing to discard.`;
+    this.body.appendChild(hint);
+
+    // Clear placed-only field refs so live-pose handlers (`updateFromPose`)
+    // no-op cleanly if they fire after a baked re-render — TS narrowing
+    // can't see this so we reassign explicitly.
+    this.xInput = undefined as unknown as HTMLInputElement;
+    this.zInput = undefined as unknown as HTMLInputElement;
+    this.rotInput = undefined as unknown as HTMLInputElement;
+    this.translateBtn = undefined as unknown as HTMLButtonElement;
+    this.rotateBtn = undefined as unknown as HTMLButtonElement;
   }
 
   /** Drag-the-head-bar to move the panel. Standard PointerEvent dance —

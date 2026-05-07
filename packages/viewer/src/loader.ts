@@ -62,6 +62,11 @@ export interface RegionData {
    *  `block.animation.framesByteOffset / 4 + N × vertexCount × 3`. Empty
    *  when no animated blocks exist in the region. */
   locsFramesPositions: Float32Array;
+  /** Per-placement stable ID, parallel to `locs.placements` by index.
+   *  Uint32 hash from the extractor; the viewer hands the hex form back to
+   *  the dev server's commit-edits endpoint as a "remove" tombstone. Empty
+   *  when the region has no placements. */
+  locsPlacementIds: Uint32Array;
 }
 
 export type LoadPhase =
@@ -155,6 +160,7 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     locsColBuf,
     locsUvBuf,
     locsFramesBuf,
+    locsPlacementIdsBuf,
   ] = await Promise.all([
     fetchBinary(`${base}/${terrainMeta.positionsFile}`),
     fetchBinary(`${base}/${terrainMeta.colorsFile}`),
@@ -173,6 +179,9 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     locs.framesFile
       ? fetchBinary(`${base}/${locs.framesFile}`)
       : Promise.resolve(new ArrayBuffer(0)),
+    locs.placementIdsByteLength > 0
+      ? fetchBinary(`${base}/${locs.placementIdsFile}`)
+      : Promise.resolve(new ArrayBuffer(0)),
   ]);
 
   return {
@@ -189,6 +198,7 @@ async function fetchBundle(regionId: number): Promise<RegionData> {
     locsColors: new Uint8Array(locsColBuf),
     locsUvs: new Float32Array(locsUvBuf),
     locsFramesPositions: new Float32Array(locsFramesBuf),
+    locsPlacementIds: new Uint32Array(locsPlacementIdsBuf),
   };
 }
 
