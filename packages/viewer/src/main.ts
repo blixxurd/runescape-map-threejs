@@ -7,6 +7,7 @@ import {
   packRegionId,
   unpackRegionId,
 } from "@rsmap/shared";
+import type { EditsOverlayAdd } from "@rsmap/shared";
 import { loadRegion, type LoadPhase, type RegionData } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs, tickLocAnimations, type LocAnimationState } from "./locs/placeLocs.js";
@@ -19,6 +20,7 @@ import { Eyedropper } from "./tools/eyedropper.js";
 import { Selection } from "./tools/selection.js";
 import { InspectorPanel } from "./tools/inspectorPanel.js";
 import { loadGlobalAtlas } from "./tools/globalAtlas.js";
+import { PendingEdits } from "./tools/pendingEdits.js";
 import { captureScreenshot } from "./util/screenshot.js";
 import { PlacesPanel } from "./ui/placesPanel.js";
 
@@ -115,6 +117,7 @@ async function setupRegion(
     region.locsColors,
     region.locsUvs,
     region.locsFramesPositions,
+    region.locsPlacementIds,
     region.terrainMeta,
     region.terrainHeights,
     atlasTexture,
@@ -386,19 +389,20 @@ async function main(): Promise<void> {
   const inspector = new DebugInspector({ camera, renderer }, []);
 
   /**
-   * Bilinear terrain-height lookup at an arbitrary world (x, z). Walks the
-   * live `regions` map to find the owning region, reads directly out of
-   * its `terrainHeights` Int16 grid.
+   * Bilinear terrain-height lookup at an arbitrary world (x, z) on the
+   * given plane (default 0). Walks the live `regions` map to find the
+   * owning region, reads directly out of its `terrainHeights` Int16 grid.
    *
    * Returns `null` when the XZ falls outside any loaded region or off the
    * cache grid. Callers (the contoured placer) should treat a miss as
    * "don't deform this vertex", matching the extractor's edge-clamp
    * behaviour for contoured locs at region boundaries.
-   *
-   * Only plane 0 is queried — user placements live on the ground for now,
-   * and sampling the actual hit's plane isn't plumbed through yet.
    */
-  const sampleTerrainAt = (worldX: number, worldZ: number): number | null => {
+  const sampleTerrainAt = (
+    worldX: number,
+    worldZ: number,
+    plane = 0,
+  ): number | null => {
     const dRx = Math.floor(worldX / REGION_SPAN);
     const dRz = Math.floor(-worldZ / REGION_SPAN);
     const rx = centerRegionX + dRx;
@@ -418,7 +422,8 @@ async function main(): Promise<void> {
     const fz = Math.max(0, Math.min(1, tileZf - Math.floor(tileZf)));
     const heights = lr.region.terrainHeights;
     const stride = VERTICES_PER_SIDE;
-    const base = 0; // plane 0 only, see docstring
+    const safePlane = Math.max(0, Math.min(3, plane));
+    const base = safePlane * VERTICES_PER_SIDE * VERTICES_PER_SIDE;
     const sw = heights[base + tz * stride + tx]!;
     const se = heights[base + tz * stride + (tx + 1)]!;
     const nw = heights[base + (tz + 1) * stride + tx]!;
@@ -512,6 +517,10 @@ async function main(): Promise<void> {
   };
 
   let toolPanel!: ToolPanel;
+  /** Forward-declared so the toolPanel constructor can wire its commit
+   *  button before the supporting state (pendingEdits, regions, placer
+   *  hooks) exists. Assigned below once everything is in scope. */
+  let commitPendingEdits: () => Promise<void> = async () => {};
   const forEachModelPlacer = (fn: (p: ModelPlacer) => void): void => {
     fn(npcPlacer);
     fn(objectPlacer);
@@ -592,6 +601,9 @@ async function main(): Promise<void> {
       forEachModelPlacer((p) => p.setSnapToTile(snap));
     },
     onScreenshot: () => takeScreenshot(),
+    // commitPendingEdits is forward-declared and assigned below — wrapping
+    // in a closure lets us resolve it lazily when the user clicks.
+    onCommit: () => void commitPendingEdits(),
   });
 
   // Panel renders the animation-picker once an NPC's bake resolves and
@@ -638,17 +650,45 @@ async function main(): Promise<void> {
     p.onRotationChanged = (rot) => toolPanel.setRotation(rot);
   });
 
+  // Plane shift feedback. `,` and `.` while a placer is armed step the
+  // placement plane down/up; surface a transient HUD message so the user
+  // sees the change without a dedicated UI element. The HUD restores on
+  // the next streamCheck tick.
+  let planeHudTimer: number | null = null;
+  forEachModelPlacer((p) => {
+    p.onPlacementPlaneChanged = (plane) => {
+      setHud(`place plane: ${plane}  (',' / '.' to change)`);
+      if (planeHudTimer !== null) window.clearTimeout(planeHudTimer);
+      planeHudTimer = window.setTimeout(() => {
+        planeHudTimer = null;
+        updateHud();
+      }, 1500);
+    };
+  });
+
   // Selection: click-to-select user-placed entities. Owns the OutlinePass
   // composer, so the tick loop renders via `selection.render()` rather
   // than the bare `renderer.render(...)`. Construction must come after
   // every placer has registered its click listener so selection's bubble
   // handler runs last and can defer to armed placers.
+  // Pending-edits store — accumulates session edits to baked locs and
+  // session-added objects until the user clicks "commit" on the toolbar.
+  // Shared across selection (which records baked-loc removes) and the
+  // object placer hook below (which records session adds).
+  const pendingEdits = new PendingEdits();
   selection = new Selection({
     scene,
     camera,
     renderer,
     canvas: renderer.domElement,
     getPlacers: () => [npcPlacer, objectPlacer, itemPlacer],
+    getRegions: () =>
+      [...regions.values()].map((r) => ({
+        regionId: r.regionId,
+        locsGroup: r.locsGroup,
+        locsManifest: r.region.locs,
+      })),
+    pendingEdits,
     isAnyToolArmed: () =>
       npcPlacer.isArmed() ||
       objectPlacer.isArmed() ||
@@ -674,6 +714,272 @@ async function main(): Promise<void> {
   forEachModelPlacer((p) => {
     p.onMeshRemoved = (mesh) => selection!.notifyMeshRemoved(mesh);
   });
+
+  // ---- Object-placer → pendingEdits bridge ----
+  //
+  // Only the Object placer feeds `pendingEdits` for now. NPCs / items /
+  // spotanims are session-only per the v1 spec — their placements vanish
+  // on reload and never round-trip into a baked region.
+  //
+  // Mesh → tracked add reference. We mutate the same EditsOverlayAdd in
+  // place when the mesh's pose changes, so PendingEdits.snapshot() always
+  // reflects the live state without per-update bookkeeping. Cleared on
+  // remove + on commit (handled in the commit handler below).
+  const pendingObjectAdds = new Map<
+    THREE.Mesh,
+    { regionId: number; add: EditsOverlayAdd }
+  >();
+
+  /** World (x, z) → (regionId, region-local tileX, tileZ). Returns null
+   *  when the position falls outside the addressable cache grid. Mirrors
+   *  `sampleTerrainAt`'s region-resolution math; tile-local coords use
+   *  cache convention (cache +Y = north, so tileZ = floor(-localZ /
+   *  TILE_SIZE)). */
+  const worldToTile = (
+    worldX: number,
+    worldZ: number,
+  ): { regionId: number; tileX: number; tileZ: number } | null => {
+    const dRx = Math.floor(worldX / REGION_SPAN);
+    const dRz = Math.floor(-worldZ / REGION_SPAN);
+    const rx = centerRegionX + dRx;
+    const rz = centerRegionZ + dRz;
+    if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) return null;
+    const localX = worldX - dRx * REGION_SPAN;
+    const localZ = -worldZ - dRz * REGION_SPAN;
+    const tileX = Math.floor(localX / TILE_SIZE);
+    const tileZ = Math.floor(localZ / TILE_SIZE);
+    if (tileX < 0 || tileX > 63 || tileZ < 0 || tileZ > 63) return null;
+    return { regionId: packRegionId(rx, rz), tileX, tileZ };
+  };
+
+  /** Decompose a free-form Y rotation (radians) into the nearest cache
+   *  cardinal (0..3, used for the bundle's `rotation` field + the
+   *  bakedRotation block lookup) plus a residual angle (radians, signed;
+   *  approximately (−π/4, π/4]) applied per-instance.
+   *
+   *  IMPORTANT: cache rotations go the OPPOSITE way around +Y than
+   *  Three.js. The extractor's `rotateModelVertices` for cache rotation 1
+   *  produces the same world-space vertex layout as `Matrix4.makeRotationY(−π/2)`.
+   *  Walked through:
+   *    cache R1 in cache coords: `(xc, yc, zc) → (zc, yc, −xc)`.
+   *    Y/Z flip in `flattenModel`: world ← `(xc, −yc, −zc)`.
+   *    Composed: world `(xw, yw, zw) → (−zw, yw, xw)` ≡ `Matrix4.makeRotationY(−π/2)`.
+   *  So cardinal R corresponds to world rotation `−R × π/2`. To match a
+   *  user-intended world rotation θ, pick cardinal = `(4 − round(θ / (π/2))) mod 4`
+   *  and residual = `θ + cardinal × π/2` (then normalise to (−π, π]).
+   *
+   *  Without this inversion, 90° and 270° placements baked at the *mirror*
+   *  edge (works at 0°/180° because they're their own mirrors). */
+  const decomposeRotation = (
+    rotationY: number,
+  ): { cardinal: number; residual: number } => {
+    let norm = rotationY % (Math.PI * 2);
+    if (norm < 0) norm += Math.PI * 2;
+    const quarters = Math.round(norm / (Math.PI / 2));
+    const cardinal = ((4 - quarters) % 4 + 4) % 4;
+    let residual = norm + cardinal * (Math.PI / 2);
+    // Normalise to (−π, π] so the residual is the smallest equivalent angle.
+    residual = residual % (Math.PI * 2);
+    if (residual > Math.PI) residual -= Math.PI * 2;
+    if (residual <= -Math.PI) residual += Math.PI * 2;
+    return { cardinal, residual };
+  };
+
+  /** Sub-tile noise threshold (world units). Anything below this lives
+   *  inside the integer-tile snap and gets dropped from the wire payload
+   *  to keep overlays clean. ~0.4% of a tile. */
+  const SUB_OFFSET_EPSILON = 0.5;
+
+  /** Compute the sub-tile world-space offset from a mesh position to its
+   *  containing tile's center. World axes: +X east, +Z south. Cache axes:
+   *  tile center at (tileX*128 + 64, _, -(tileZ*128 + 64)) in world. */
+  const subOffsetForTile = (
+    mesh: THREE.Mesh,
+    tileX: number,
+    tileZ: number,
+  ): { offsetX?: number; offsetZ?: number } => {
+    const tileCenterX = tileX * TILE_SIZE + TILE_SIZE / 2;
+    const tileCenterZ = -(tileZ * TILE_SIZE + TILE_SIZE / 2);
+    const offsetX = mesh.position.x - tileCenterX;
+    const offsetZ = mesh.position.z - tileCenterZ;
+    return {
+      ...(Math.abs(offsetX) >= SUB_OFFSET_EPSILON ? { offsetX } : {}),
+      ...(Math.abs(offsetZ) >= SUB_OFFSET_EPSILON ? { offsetZ } : {}),
+    };
+  };
+
+  objectPlacer.onPlacementSpawned = (mesh, id, _name, modelType, plane) => {
+    const tile = worldToTile(mesh.position.x, mesh.position.z);
+    if (!tile) {
+      console.warn(`[commit] object spawn at (${mesh.position.x}, ${mesh.position.z}) outside loaded grid; not tracking`);
+      return;
+    }
+    // Use the placement type the extractor's bakeObject chose for this
+    // loc (its first declared `objectTypes[]`). Walls (0..3), wall decor
+    // (4..8), and floor decor (22) all need their native type — hardcoded
+    // 10 made fences (type 0) silently vanish on re-bake.
+    const { cardinal, residual } = decomposeRotation(mesh.rotation.y);
+    const add: EditsOverlayAdd = {
+      locId: id,
+      plane,
+      tileX: tile.tileX,
+      tileZ: tile.tileZ,
+      type: modelType ?? 10,
+      rotation: cardinal,
+      animationOverride: null,
+      ...subOffsetForTile(mesh, tile.tileX, tile.tileZ),
+      ...(Math.abs(residual) > 1e-4 ? { rotationY: residual } : {}),
+    };
+    pendingEdits.addAdd(tile.regionId, add);
+    pendingObjectAdds.set(mesh, { regionId: tile.regionId, add });
+  };
+
+  objectPlacer.onPlacementUpdated = (mesh) => {
+    const tracked = pendingObjectAdds.get(mesh);
+    if (!tracked) return;
+    const tile = worldToTile(mesh.position.x, mesh.position.z);
+    if (!tile) return;
+    if (tile.regionId !== tracked.regionId) {
+      // Crossed a region boundary — re-key under the new region. The
+      // previous region's pendingEdits entry must drop the old add.
+      pendingEdits.deleteAdd(tracked.regionId, tracked.add);
+      tracked.regionId = tile.regionId;
+      pendingEdits.addAdd(tile.regionId, tracked.add);
+    }
+    tracked.add.tileX = tile.tileX;
+    tracked.add.tileZ = tile.tileZ;
+    const { cardinal, residual } = decomposeRotation(mesh.rotation.y);
+    tracked.add.rotation = cardinal;
+    if (Math.abs(residual) > 1e-4) tracked.add.rotationY = residual;
+    else delete tracked.add.rotationY;
+    // Recompute sub-tile offset on every drag so the committed value
+    // tracks the latest cursor position. Below-epsilon offsets get
+    // dropped to keep overlays clean.
+    const sub = subOffsetForTile(mesh, tile.tileX, tile.tileZ);
+    if (sub.offsetX !== undefined) tracked.add.offsetX = sub.offsetX;
+    else delete tracked.add.offsetX;
+    if (sub.offsetZ !== undefined) tracked.add.offsetZ = sub.offsetZ;
+    else delete tracked.add.offsetZ;
+    pendingEdits.notifyChange();
+  };
+
+  objectPlacer.onMeshRemoved = (mesh) => {
+    selection!.notifyMeshRemoved(mesh);
+    const tracked = pendingObjectAdds.get(mesh);
+    if (!tracked) return;
+    pendingEdits.deleteAdd(tracked.regionId, tracked.add);
+    pendingObjectAdds.delete(mesh);
+  };
+
+  // Drive the toolbar's commit button from pendingEdits state. Called now
+  // and on every onChange tick.
+  let commitInFlight = false;
+  const refreshCommitButton = (): void => {
+    toolPanel.setCommitState({
+      pending: pendingEdits.count(),
+      busy: commitInFlight,
+    });
+  };
+  pendingEdits.onChange = refreshCommitButton;
+  refreshCommitButton();
+
+  // Warn the user if they try to close/reload the tab with un-committed
+  // edits. Browsers ignore the custom message and show their own confirm
+  // — the API still requires preventDefault() + returnValue assignment.
+  window.addEventListener("beforeunload", (e) => {
+    if (pendingEdits.isPending() || commitInFlight) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
+
+  // Helper: tear down a region's scene state so startLoad can re-fetch it
+  // from a freshly re-baked bundle. Doesn't dispose GPU buffers explicitly;
+  // Three.js's GC handles that on next render. Inspector + eyedropper
+  // hold stale references to the old groups but their addRegion calls are
+  // idempotent (keyed by regionId) so the next setup overwrites them.
+  const removeRegionFromScene = (regionId: number): void => {
+    const lr = regions.get(regionId);
+    if (!lr) return;
+    scene.remove(lr.terrainGroup);
+    scene.remove(lr.locsGroup);
+    regions.delete(regionId);
+  };
+
+  /**
+   * POST every pending diff to /api/dev/commit-edits, then reload each
+   * affected region from the freshly re-baked bundle. Order:
+   *   1. Snapshot pendingEdits (frozen reference set).
+   *   2. POST each region's diff.
+   *   3. On success per region:
+   *      a. Remove session meshes for committed adds (so they don't
+   *         duplicate the now-baked InstancedMesh slot).
+   *      b. Drop only the snapshot's entries from pendingEdits — any
+   *         brand-new edits made during the in-flight POST stay.
+   *      c. Tear down the region's scene state and re-trigger startLoad.
+   *   4. On failure per region: leave pending edits alone, surface error.
+   */
+  commitPendingEdits = async (): Promise<void> => {
+    if (commitInFlight) return;
+    if (!pendingEdits.isPending()) return;
+    const snapshot = pendingEdits.snapshot();
+    commitInFlight = true;
+    refreshCommitButton();
+    let failures = 0;
+    setHud(`committing ${snapshot.size} region(s)…`);
+    try {
+      for (const [regionId, diff] of snapshot) {
+        try {
+          // The dev endpoint serialises save+extract behind a per-region
+          // mutex, so we just await the response. JSON.stringify(diff)
+          // freezes the wire payload — even if pendingEdits' add objects
+          // mutate later, the server sees the values at this moment.
+          const r = await fetch(
+            `/api/dev/commit-edits?region=${regionId}`,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(diff),
+            },
+          );
+          if (!r.ok) {
+            const body = (await r.json().catch(() => ({}))) as { error?: string };
+            throw new Error(`HTTP ${r.status}: ${body.error ?? "unknown"}`);
+          }
+
+          // Pre-clean: remove session meshes for adds we just committed so
+          // they don't double up against the new InstancedMesh.
+          for (const [mesh, info] of [...pendingObjectAdds]) {
+            if (info.regionId === regionId && diff.adds.includes(info.add)) {
+              objectPlacer.removeMesh(mesh);
+            }
+          }
+          // Drop only this snapshot's entries (preserving any new edits
+          // the user made during the in-flight POST).
+          for (const hex of diff.removes) pendingEdits.removeRemove(regionId, hex);
+          for (const add of diff.adds) pendingEdits.deleteAdd(regionId, add);
+
+          // Reload the region from disk — the bundle now reflects the
+          // committed overlay.
+          removeRegionFromScene(regionId);
+          await startLoad(regionId);
+        } catch (err) {
+          console.error(`[commit] region ${regionId} failed:`, err);
+          failures++;
+        }
+      }
+    } finally {
+      commitInFlight = false;
+      refreshCommitButton();
+      setHud(
+        failures > 0
+          ? `commit done (${failures} failed — see console)`
+          : `commit done`,
+      );
+      // Restore the normal HUD on the next streamCheck tick.
+      updateHud();
+    }
+  };
 
   // Inspector panel — listens to selection events and pushes property
   // edits back through the placer's mutation methods.

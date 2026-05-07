@@ -69,6 +69,7 @@ export function placeLocs(
   colors: Uint8Array,
   uvs: Float32Array,
   framesPositions: Float32Array,
+  placementIds: Uint32Array,
   terrainMeta: TerrainMeta,
   terrainHeights: Int16Array,
   atlasTexture: THREE.Texture,
@@ -251,6 +252,12 @@ export function placeLocs(
       wz += disp * dz;
     }
 
+    // Free-place sub-tile offset (commit-edits adds only). Cache placements
+    // never set these; for them the fields are absent and the lookup is
+    // a no-op.
+    if (p.offsetX) wx += p.offsetX;
+    if (p.offsetZ) wz += p.offsetZ;
+
     // Placement Y = terrain height at the model's bounding-box center.
     // The client-space Z of that point is `-wz` (world +Z = south is the
     // negation of client +Z = north). Sampling here (not at the base
@@ -396,9 +403,10 @@ export function placeLocs(
   const tmpMatrix = new THREE.Matrix4();
 
   // Emit one InstancedMesh per (block, plane) pair that qualified.
-  // Instance matrices are translation-only — rotation is pre-baked into
-  // the block geometry by the extractor (OSRS rotations above 3 require
-  // extra transforms we can't express as a matrix).
+  // Instance matrices are translation + optional Y-rotation. Cardinal
+  // rotations are pre-baked into the block geometry by the extractor
+  // (cache convention); per-instance `rotationY` (radians) is the
+  // residual non-cardinal angle from the in-viewer free-rotation editor.
   for (const entry of instEntries) {
     const block = manifest.blocks[entry.blockIdx]!;
     const geom = geometries[entry.blockIdx]!;
@@ -406,9 +414,21 @@ export function placeLocs(
     inst.name = `loc:${block.locId}:${block.modelType}:${block.bakedRotation}:p${entry.plane}`;
     inst.userData.blockIndex = entry.blockIdx;
     inst.userData.placementIdxs = entry.placementIdxs;
+    // Whole-region placementIds array — readers index it with the
+    // resolved placementIdx (from `placementIdxs[instanceId]`). Empty
+    // when the bundle predates the placementIds.bin schema field;
+    // resolveHitToPlacement handles that case.
+    inst.userData.placementIds = placementIds;
     for (let i = 0; i < entry.placementIdxs.length; i++) {
-      const { wx, wy, wz } = placementWorldPos(entry.placementIdxs[i]!, block);
-      tmpMatrix.makeTranslation(wx, wy, wz);
+      const placementIdx = entry.placementIdxs[i]!;
+      const { wx, wy, wz } = placementWorldPos(placementIdx, block);
+      const placement = manifest.placements[placementIdx]!;
+      const rotationY = placement.rotationY ?? 0;
+      if (rotationY !== 0) {
+        tmpMatrix.makeRotationY(rotationY).setPosition(wx, wy, wz);
+      } else {
+        tmpMatrix.makeTranslation(wx, wy, wz);
+      }
       inst.setMatrixAt(i, tmpMatrix);
     }
     inst.instanceMatrix.needsUpdate = true;
@@ -440,14 +460,26 @@ export function placeLocs(
       const block = manifest.blocks[p.blockIndex]!;
       const n = block.vertexCount;
       const { wx, wy, wz } = placementWorldPos(placementIdx, block);
+      // Per-vertex rotation around world Y (right-hand rule: +Z → +X for
+      // positive angle). Free-rotation overlay adds bake the residual
+      // non-cardinal angle here; cache placements have rotationY = 0
+      // (cardinals are pre-baked into the block geometry already).
+      const rotationY = p.rotationY ?? 0;
+      const cosR = rotationY === 0 ? 1 : Math.cos(rotationY);
+      const sinR = rotationY === 0 ? 0 : Math.sin(rotationY);
 
       const posSrc = block.positionsByteOffset / 4;
       const colSrc = block.colorsByteOffset;
       const uvSrc = block.uvsByteOffset / 4;
       for (let v = 0; v < n; v++) {
-        pos[(vCursor + v) * 3 + 0] = positions[posSrc + v * 3 + 0]! + wx;
-        pos[(vCursor + v) * 3 + 1] = positions[posSrc + v * 3 + 1]! + wy;
-        pos[(vCursor + v) * 3 + 2] = positions[posSrc + v * 3 + 2]! + wz;
+        const lx = positions[posSrc + v * 3 + 0]!;
+        const ly = positions[posSrc + v * 3 + 1]!;
+        const lz = positions[posSrc + v * 3 + 2]!;
+        const rx = rotationY === 0 ? lx : cosR * lx + sinR * lz;
+        const rz = rotationY === 0 ? lz : -sinR * lx + cosR * lz;
+        pos[(vCursor + v) * 3 + 0] = rx + wx;
+        pos[(vCursor + v) * 3 + 1] = ly + wy;
+        pos[(vCursor + v) * 3 + 2] = rz + wz;
       }
       col.set(colors.subarray(colSrc, colSrc + n * 4), vCursor * 4);
       uv.set(uvs.subarray(uvSrc, uvSrc + n * 2), vCursor * 2);
@@ -466,6 +498,7 @@ export function placeLocs(
     mesh.userData.isMergedLocs = true;
     mesh.userData.plane = plane;
     mesh.userData.placementByTri = placementByTri;
+    mesh.userData.placementIds = placementIds;
     planeGroups[plane]!.add(mesh);
   }
 

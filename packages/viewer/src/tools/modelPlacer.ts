@@ -31,9 +31,10 @@ export interface ModelPlacerHost {
   canvas: HTMLCanvasElement;
   /** Terrain meshes the click raycast should run against. */
   getTerrainObjects: () => THREE.Object3D[];
-  /** Bilinear terrain-height lookup. Returns `null` when no loaded region
-   *  covers (worldX, worldZ). Used by contoured-object deformation. */
-  sampleTerrainAt: (worldX: number, worldZ: number) => number | null;
+  /** Bilinear terrain-height lookup at the given plane (default 0). Returns
+   *  `null` when no loaded region covers (worldX, worldZ). Used by both
+   *  the placer's pose-clamp and contoured-object deformation. */
+  sampleTerrainAt: (worldX: number, worldZ: number, plane?: number) => number | null;
 }
 
 export interface ModelPlacerConfig {
@@ -51,6 +52,10 @@ export interface ModelPlacerConfig {
 interface CachedEntity {
   geometry: THREE.BufferGeometry;
   name: string;
+  /** Present only on `/api/object` responses. The OSRS placement type
+   *  (0..22) the bake chose for this loc. Used by the commit-edits hook
+   *  so the cache add records the right type. */
+  modelType?: number;
   /** Present only on `/api/object` responses. `undefined` → rigid model.
    *  Defined (including 0) → apply contour-ground deformation. See
    *  `applyContourDeformation` for the two opcode variants. */
@@ -91,6 +96,10 @@ interface PlacedEntity {
   mesh: THREE.Mesh;
   id: number;
   name: string;
+  /** OSRS plane (0..3) the placement was committed to. Used by
+   *  `updatePose` to re-sample terrain Y on the same floor; without this,
+   *  dragging a plane-1 placement would snap it back to ground. */
+  plane: number;
   /** The bake this placement was built from. Held so `duplicate` /
    *  `updatePose` (contour redeform) can re-run the same per-vertex math
    *  without round-tripping the network cache. */
@@ -127,6 +136,12 @@ interface BakedResponse {
   positions: number[];
   colors: number[];
   uvs: number[];
+  /** Objects only — the OSRS placement type (0..22) the bake picked from
+   *  the def's `objectTypes`. Walls (0..3), wall decor (4..8), normal
+   *  scenery (10), floor decor (22). The commit-edits hook needs this
+   *  so the re-extracted placement uses the SAME type the user saw —
+   *  hardcoding 10 silently dropped fences/doors during re-bake. */
+  modelType?: number;
   /** Objects only — present means the viewer should contour this
    *  placement's vertices against terrain. */
   contouredGround?: number;
@@ -174,6 +189,12 @@ export class ModelPlacer implements Placer {
    *  to mutate because no placed mesh holds a reference. */
   private ghostContourGeom: THREE.BufferGeometry | null = null;
 
+  /** Last terrain hit recorded by `handleMove`. Cached so we can refresh
+   *  the ghost preview without a fresh mouse event — used by the plane
+   *  shortcuts (`,` / `.`) so the ghost lifts to the new floor instantly
+   *  instead of waiting for the next mousemove. */
+  private lastTerrainHit: { x: number; y: number; z: number } | null = null;
+
   /** 0-7 eighth-turns around world +Y (45° increments). R cycles forward,
    *  Shift+R cycles backward. Eighth-turns let users place fences/walls
    *  diagonally across a tile — OSRS caches only do quarter-turns, but
@@ -186,6 +207,12 @@ export class ModelPlacer implements Placer {
    *  part of the map" guarantee. Off by default — tile snap is what users
    *  expect in an OSRS editor. */
   private snapToTile = true;
+
+  /** OSRS plane (0..3) the next placement will be committed to. Adjusted
+   *  with `,` (down) and `.` (up) while the placer is armed. The ghost
+   *  preview lifts to the chosen plane's terrain Y immediately so the user
+   *  sees what they'll get on commit. Reset to 0 on cancel. */
+  private placementPlane = 0;
 
   /** Mirrors the physical Shift key. When held AND a placer is armed we
    *  hide the ghost and flip the cursor to a delete indicator — the same
@@ -200,6 +227,28 @@ export class ModelPlacer implements Placer {
    *  selection's Delete key). Selection listens so it can clear stale
    *  state if the removed mesh was the current selection. */
   onMeshRemoved: ((mesh: THREE.Mesh) => void) | null = null;
+  /** Fired when a new placement spawns from a click or duplicate. Used by
+   *  the commit-edits hook to register the spawn in `PendingEdits`.
+   *  `modelType` is the OSRS placement type (0..22) the bake chose for
+   *  this loc — wall (0..3), wall decor (4..8), normal scenery (10),
+   *  floor decor (22). NPCs/items/spotanims pass `undefined`.
+   *  `plane` is the OSRS plane (0..3) at which to commit the placement. */
+  onPlacementSpawned:
+    | ((
+        mesh: THREE.Mesh,
+        id: number,
+        name: string,
+        modelType: number | undefined,
+        plane: number,
+      ) => void)
+    | null = null;
+  /** Fired when the user changes the placement plane (`,` / `.` shortcuts).
+   *  Tool panel listens so the armed banner can show "plane N". */
+  onPlacementPlaneChanged: ((plane: number) => void) | null = null;
+  /** Fired when an existing placement's pose changes (gizmo drag, numeric
+   *  input, arrow nudge). Lets the commit-edits hook update the matching
+   *  `EditsOverlayAdd`. */
+  onPlacementUpdated: ((mesh: THREE.Mesh) => void) | null = null;
   /** Fires once per successful `arm()` with whatever animation metadata
    *  the server returned (NPC-only today). Lets the panel show a picker
    *  of available sequences without the placer knowing about the DOM. */
@@ -269,6 +318,19 @@ export class ModelPlacer implements Placer {
     this.armedName = name;
     this.refreshArmedCursor();
     this.hideGhost();
+    // Clear the previous arm's cached entity + contour-ghost geometry.
+    // Without this, two failure modes:
+    //   (1) `handleMove` runs with the OLD entity while the new fetch is
+    //       in flight, briefly previewing the wrong loc.
+    //   (2) Switching between two contoured locs short-circuits the
+    //       `if (!this.ghostContourGeom)` check, so the new entity gets
+    //       its positions deformed into the OLD entity's clone — colors
+    //       and UVs stay stale.
+    this.armedEntity = null;
+    if (this.ghostContourGeom) {
+      this.ghostContourGeom.dispose();
+      this.ghostContourGeom = null;
+    }
     const fetchPromise = this.getOrFetch(id, animationOverride);
     this.armedFetch = fetchPromise;
     // Attach the geometry to the ghost as soon as it resolves, provided the
@@ -327,6 +389,54 @@ export class ModelPlacer implements Placer {
     this.snapToTile = enabled;
   }
 
+  /** Read-only — the plane the next placement will commit to. */
+  getPlacementPlane(): number {
+    return this.placementPlane;
+  }
+
+  /** Set the active placement plane (0..3). Out-of-range values clamp.
+   *  Fires `onPlacementPlaneChanged` so the panel banner can refresh.
+   *  Refreshes the ghost preview from the cached last cursor hit so the
+   *  user doesn't have to wiggle the mouse to see the new floor. */
+  setPlacementPlane(plane: number): void {
+    const clamped = Math.max(0, Math.min(3, plane | 0));
+    if (clamped === this.placementPlane) return;
+    this.placementPlane = clamped;
+    this.onPlacementPlaneChanged?.(clamped);
+    this.refreshGhostFromLastHit();
+  }
+
+  /** Re-run the ghost positioning logic against the cached last cursor
+   *  position. Used by plane-shift (no fresh mouse event) and any other
+   *  state change that should immediately reflect in the preview. */
+  private refreshGhostFromLastHit(): void {
+    if (!this.armedEntity || !this.lastTerrainHit) return;
+    if (this.shiftHeld) return;
+    const point = new THREE.Vector3(
+      this.lastTerrainHit.x,
+      this.lastTerrainHit.y,
+      this.lastTerrainHit.z,
+    );
+    const pose = this.resolvePose(point);
+    if (this.armedEntity.contouredGround !== undefined) {
+      if (!this.ghostContourGeom) {
+        this.ghostContourGeom = this.armedEntity.geometry.clone();
+        this.ghostMesh.geometry = this.ghostContourGeom;
+      }
+      applyContourDeformation(
+        this.armedEntity.basePositions,
+        this.ghostContourGeom.attributes.position as THREE.BufferAttribute,
+        this.armedEntity.modelHeight,
+        this.armedEntity.contouredGround,
+        pose,
+        this.host.sampleTerrainAt,
+      );
+    }
+    this.ghostMesh.position.copy(pose.position);
+    this.ghostMesh.rotation.y = pose.rotationRad;
+    this.ghostMesh.visible = true;
+  }
+
   clearAll(): void {
     const removed = this.placed.slice();
     for (const p of this.placed) {
@@ -358,7 +468,7 @@ export class ModelPlacer implements Placer {
   updatePose(mesh: THREE.Mesh, position: THREE.Vector3, rotationRad: number): void {
     const placement = this.placed.find((p) => p.mesh === mesh);
     if (!placement) return;
-    const sampledY = this.host.sampleTerrainAt(position.x, position.z);
+    const sampledY = this.host.sampleTerrainAt(position.x, position.z, placement.plane);
     const finalY = sampledY ?? position.y;
     mesh.position.set(position.x, finalY, position.z);
     mesh.rotation.y = rotationRad;
@@ -376,6 +486,7 @@ export class ModelPlacer implements Placer {
         this.host.sampleTerrainAt,
       );
     }
+    this.onPlacementUpdated?.(mesh);
   }
 
   /** Remove a placement by mesh reference. Used both by shift-click delete
@@ -438,17 +549,27 @@ export class ModelPlacer implements Placer {
 
   private handleKey(e: KeyboardEvent): void {
     if (!this.isArmed()) return;
-    if (e.key !== "r" && e.key !== "R") return;
     // Skip when a form field has focus — the search input lives on top of
     // the canvas and we don't want to cycle rotation on every "r" keystroke
     // the user types in a search query.
     const tag = (e.target as HTMLElement | null)?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA") return;
-    const step = e.shiftKey ? 7 : 1; // Shift+R = rotate the other way (+7 ≡ -1 mod 8).
-    this.placementRotation = (this.placementRotation + step) & 7;
-    // Keep the ghost oriented to match the pending placement rotation.
-    this.ghostMesh.rotation.y = (this.placementRotation * Math.PI) / 4;
-    this.onRotationChanged?.(this.placementRotation);
+    if (e.key === "r" || e.key === "R") {
+      const step = e.shiftKey ? 7 : 1; // Shift+R = rotate the other way (+7 ≡ -1 mod 8).
+      this.placementRotation = (this.placementRotation + step) & 7;
+      // Keep the ghost oriented to match the pending placement rotation.
+      this.ghostMesh.rotation.y = (this.placementRotation * Math.PI) / 4;
+      this.onRotationChanged?.(this.placementRotation);
+      return;
+    }
+    if (e.key === ",") {
+      this.setPlacementPlane(this.placementPlane - 1);
+      return;
+    }
+    if (e.key === ".") {
+      this.setPlacementPlane(this.placementPlane + 1);
+      return;
+    }
   }
 
   private handleShift(e: KeyboardEvent, down: boolean): void {
@@ -494,6 +615,10 @@ export class ModelPlacer implements Placer {
       this.hideGhost();
       return;
     }
+    // Cache the hit so plane shortcuts can refresh the ghost without a
+    // fresh mouse event. Stored as a plain object — keeping a Vector3
+    // would risk holding a stale reference to the raycaster's pool.
+    this.lastTerrainHit = { x: hit.point.x, y: hit.point.y, z: hit.point.z };
     const pose = this.resolvePose(hit.point);
     if (entity.contouredGround !== undefined) {
       // Rebuild the ghost geometry every move — cheap (a few hundred
@@ -522,7 +647,11 @@ export class ModelPlacer implements Placer {
 
   /** Placement pose for the armed entity at a raycast hit. Tile-center
    *  snap on XZ, user-controlled `placementRotation` (eighth-turns)
-   *  converted to radians here so callers don't repeat the math. */
+   *  converted to radians here so callers don't repeat the math. Y is
+   *  re-sampled at the active `placementPlane`'s terrain so the ghost
+   *  (and the eventual placement) sit on the chosen floor — clicking
+   *  ground while the placer is set to plane 1 lifts the ghost up to
+   *  the second-floor terrain at that XZ. */
   private resolvePose(worldPoint: THREE.Vector3): {
     position: THREE.Vector3;
     rotationRad: number;
@@ -533,6 +662,8 @@ export class ModelPlacer implements Placer {
     const position = this.snapToTile
       ? snapToTileCenter(worldPoint)
       : worldPoint.clone();
+    const planeY = this.host.sampleTerrainAt(position.x, position.z, this.placementPlane);
+    if (planeY !== null) position.y = planeY;
     return { position, rotationRad: (this.placementRotation * Math.PI) / 4 };
   }
 
@@ -644,6 +775,7 @@ export class ModelPlacer implements Placer {
       mesh,
       id,
       name,
+      plane: this.placementPlane,
       cached: baked,
       ownsGeometry: owns,
       animationId: baked.activeAnimationId,
@@ -659,6 +791,7 @@ export class ModelPlacer implements Placer {
     }
     this.placed.push(placement);
     this.onPlacementsChanged?.(this.placed.length);
+    this.onPlacementSpawned?.(mesh, id, name, baked.modelType, this.placementPlane);
     return placement;
   }
 
@@ -805,6 +938,7 @@ export class ModelPlacer implements Placer {
       return {
         geometry: geom,
         name: body.name,
+        modelType: body.modelType,
         contouredGround: body.contouredGround,
         basePositions: positions,
         modelHeight,

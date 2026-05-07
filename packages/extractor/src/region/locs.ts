@@ -12,7 +12,16 @@ import { join } from "node:path";
 import { hsl16ToRgb } from "../color/hsl.js";
 import { computeFaceUv, cellUV } from "../texture/locFaceUv.js";
 import type { BakedAtlas } from "../texture/atlas.js";
-import type { LocsManifest, LocBlock, LocPlacement, LocsDebug, LocDebugBlock, LocMorphSpec } from "@rsmap/shared";
+import type {
+  LocsManifest,
+  LocBlock,
+  LocPlacement,
+  LocsDebug,
+  LocDebugBlock,
+  LocMorphSpec,
+  EditsOverlay,
+  EditsOverlayAdd,
+} from "@rsmap/shared";
 import {
   TILE_SIZE,
   TILES_PER_SIDE,
@@ -20,6 +29,7 @@ import {
   LOCS_DEBUG_SCHEMA,
 } from "@rsmap/shared";
 import { applyFramePose, rotateModelVertices } from "./animate.js";
+import { placementHash } from "./edits.js";
 
 import {
   BASE_AMBIENT,
@@ -279,8 +289,18 @@ async function bakeAnimationFrames(
   return frames;
 }
 
-/** Resolve all unique (locId, modelType, bakedRotation) combinations → models. */
-export async function prepareLocs(cache: RSCache, regionX: number, regionZ: number): Promise<LocsPlan> {
+/** Resolve all unique (locId, modelType, bakedRotation) combinations → models.
+ *
+ *  `overlayAdds` lets the in-viewer commit feature inject extra placements
+ *  whose `(locId, modelType, bakedRotation)` triples must ride the same
+ *  model-fetch + atlas-collection pipeline as the cache placements. Pass
+ *  `undefined`/`[]` for the no-edits case. */
+export async function prepareLocs(
+  cache: RSCache,
+  regionX: number,
+  regionZ: number,
+  overlayAdds: EditsOverlayAdd[] | undefined = undefined,
+): Promise<LocsPlan> {
   console.log(`[locs] getLoc(${regionX}, ${regionZ})`);
   let locDef: LocationDefinition | undefined;
   try {
@@ -299,7 +319,9 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     contoured: 0,
     contouredThresholded: 0,
   };
-  if (!locDef || !locDef.locations || locDef.locations.length === 0) {
+  const cacheLocations = locDef?.locations ?? [];
+  const adds = overlayAdds ?? [];
+  if (cacheLocations.length === 0 && adds.length === 0) {
     console.warn(`[locs] no location data for region (${regionX}, ${regionZ})`);
     return {
       regionX,
@@ -314,14 +336,27 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
       morphs: new Map(),
     };
   }
-  console.log(`[locs] ${locDef.locations.length} placements`);
+  console.log(`[locs] ${cacheLocations.length} cache placements + ${adds.length} overlay adds`);
 
   const drawKey = (locId: number, modelType: number, bakedRotation: number): string =>
     `${locId}:${modelType}:${bakedRotation}`;
   const uniqueDraws = new Map<string, { locId: number } & BlockDraw>();
-  for (const p of locDef.locations) {
+  for (const p of cacheLocations) {
     for (const draw of expandPlacement(p.type, p.orientation)) {
       uniqueDraws.set(drawKey(p.id, draw.modelType, draw.bakedRotation), { locId: p.id, ...draw });
+    }
+  }
+  // Overlay adds: fold their (locId, modelType, bakedRotation) triples into
+  // the same map so atlas + model resolution covers them. An add referencing
+  // an unknown locId silently falls into `skipReasons.noDef++` below — the
+  // commit-edits API endpoint pre-validates locIds against the object
+  // catalog so this should be unreachable in practice.
+  for (const a of adds) {
+    for (const draw of expandPlacement(a.type, a.rotation)) {
+      uniqueDraws.set(drawKey(a.locId, draw.modelType, draw.bakedRotation), {
+        locId: a.locId,
+        ...draw,
+      });
     }
   }
   console.log(`[locs] ${uniqueDraws.size} unique (locId, modelType, rotation) blocks`);
@@ -361,9 +396,11 @@ export async function prepareLocs(cache: RSCache, regionX: number, regionZ: numb
     { varKind: "varbit" | "varp"; varId: number; alternates: number[] }
   >();
   // Preserve the per-source draw set so we know which (modelType, rotation)
-  // combos to instantiate the alternates with.
+  // combos to instantiate the alternates with. Only cache placements
+  // contribute to morph alternates — overlay adds reference concrete locIds
+  // and don't trigger morph expansion.
   const drawsBySourceLoc = new Map<number, BlockDraw[]>();
-  for (const p of locDef.locations) {
+  for (const p of cacheLocations) {
     if (!drawsBySourceLoc.has(p.id)) {
       drawsBySourceLoc.set(p.id, expandPlacement(p.type, p.orientation));
     }
@@ -676,6 +713,11 @@ export interface BakedLocs {
   /** Packed frame positions for animated blocks. Absent (length 0) if no
    *  animated blocks survived the bake. */
   framesPositions: Float32Array;
+  /** Per-placement stable ID, parallel to `manifest.placements` by index.
+   *  Hash of `(plane, localX, localY, locId, origType, origRotation)`.
+   *  Used by the in-viewer "commit edits" feature to tombstone individual
+   *  placements during a re-extract. */
+  placementIds: Uint32Array;
   debug: LocsDebug;
 }
 
@@ -1026,11 +1068,17 @@ function flattenPositionsFor(
   return positions;
 }
 
-/** Phase 2: serialize resolved blocks + placements into a bundle. */
+/** Phase 2: serialize resolved blocks + placements into a bundle.
+ *
+ *  `overlay` (when non-null) applies the in-viewer "commit edits" feature:
+ *    - `removes`: drop any cache-record or add whose placement-hash matches.
+ *    - `adds`: synthesise extra placements alongside the cache locations.
+ *  Pass `null` for the no-edits case. */
 export function emitLocs(
   plan: LocsPlan,
   atlas: BakedAtlas,
   terrainHeights: number[][][],
+  overlay: EditsOverlay | null = null,
 ): BakedLocs {
   const blocks: LocBlock[] = [];
   const positionsChunks: Float32Array[] = [];
@@ -1161,72 +1209,149 @@ export function emitLocs(
 
   // Placements. Contoured placements each get their own deformed-geometry
   // block (instance count 1). Non-contoured placements reuse the shared
-  // block by key.
-  const placements: LocPlacement[] = [];
-  let contouredPlacementCount = 0;
+  // block by key. Cache records and overlay-add records are normalised to
+  // a single shape before iterating — that way overlay adds ride the same
+  // contoured/shared/blockedEdges/placementHash math without parallel paths.
+  interface NormalizedRecord {
+    locId: number;
+    /** OSRS placement type 0..22. */
+    type: number;
+    /** Cache rotation 0..3. */
+    rotation: number;
+    /** Region-local tile coords (0..63). `localY` follows the cache's
+     *  `+Y = north` convention — viewer code maps localY → viewer-Z. */
+    localX: number;
+    localY: number;
+    plane: number;
+    /** Optional sub-tile world-unit offset. Cache placements never set
+     *  these; overlay adds pass them through from the free-place editor. */
+    offsetX?: number;
+    offsetZ?: number;
+    /** Optional non-cardinal residual rotation (radians) applied on top
+     *  of the cardinal `rotation` for free-rotation editor adds. */
+    rotationY?: number;
+  }
+  const records: NormalizedRecord[] = [];
   if (plan.locDef) {
     for (const p of plan.locDef.locations) {
-      for (const draw of expandPlacement(p.type, p.orientation)) {
-        const key = `${p.id}:${draw.modelType}:${draw.bakedRotation}`;
-        const rb = resolvedByKey.get(key);
-        if (!rb) continue;
-
-        let blockIndex: number;
-        if (rb.contoured) {
-          const origin = clientOriginForPlacement(
-            p.position.localX,
-            p.position.localY,
-            p.type,
-            p.orientation,
-            rb.sizeX,
-            rb.sizeY,
-          );
-          const deformed = deformContouredModel(
-            rb.model,
-            origin.x,
-            origin.z,
-            p.position.height,
-            rb.contouredThreshold,
-            terrainHeights,
-          );
-          const flat = flattenModel(deformed, atlas, rb.ambient, rb.contrast);
-          blockIndex = pushBlock(rb, flat);
-          contouredPlacementCount++;
-        } else {
-          const sharedIndex = sharedBlockByKey.get(key);
-          if (sharedIndex === undefined) continue;
-          blockIndex = sharedIndex;
-        }
-
-        // Phase 2: derived per-placement edge/corner block bits.
-        // `expandPlacement` may have emitted multiple draws per cache
-        // record (e.g. WALL_CORNER → two halves), but each draw is one
-        // LocPlacement and should report the same blockedEdges since
-        // collision is per-cache-record, not per-half. The reference
-        // client does this in `Landscape.java:1017`: it calls `addWall`
-        // once per cache record with both orientations OR'd in.
-        //
-        // `blockingMask` (cache opcode 79) overrides the type-derived
-        // table when set — applies to every draw of the same record.
-        const mask = rb.defFields.blockingMask;
-        const blockedEdges =
-          mask !== undefined && mask !== 0
-            ? mask & 0xff
-            : deriveBlockedEdges(p.type, p.orientation);
-
-        placements.push({
-          locId: p.id,
-          origType: p.type,
-          origRotation: p.orientation,
-          x: p.position.localX,
-          z: p.position.localY,
-          plane: p.position.height,
-          blockIndex,
-          blockedEdges,
-        });
-      }
+      records.push({
+        locId: p.id,
+        type: p.type,
+        rotation: p.orientation,
+        localX: p.position.localX,
+        localY: p.position.localY,
+        plane: p.position.height,
+      });
     }
   }
+  if (overlay) {
+    for (const a of overlay.adds) {
+      records.push({
+        locId: a.locId,
+        type: a.type,
+        rotation: a.rotation,
+        localX: a.tileX,
+        localY: a.tileZ,
+        plane: a.plane,
+        ...(a.offsetX !== undefined && a.offsetX !== 0 ? { offsetX: a.offsetX } : {}),
+        ...(a.offsetZ !== undefined && a.offsetZ !== 0 ? { offsetZ: a.offsetZ } : {}),
+        ...(a.rotationY !== undefined && a.rotationY !== 0 ? { rotationY: a.rotationY } : {}),
+      });
+    }
+  }
+
+  const removeSet = new Set<string>(overlay?.removes ?? []);
+  const placements: LocPlacement[] = [];
+  // Parallel to `placements` by index — uint32 hash of the source-record
+  // tuple. `expandPlacement` may emit multiple draws per record (e.g.
+  // WALL_CORNER → two halves) but every draw shares the source-record
+  // hash, matching the OSRS reference client's per-record collision model.
+  const placementIdsList: number[] = [];
+  let contouredPlacementCount = 0;
+  let removedCount = 0;
+  for (const rec of records) {
+    const hashHex = placementHash(
+      rec.plane,
+      rec.localX,
+      rec.localY,
+      rec.locId,
+      rec.type,
+      rec.rotation,
+    );
+    if (removeSet.has(hashHex)) {
+      removedCount++;
+      continue;
+    }
+    // Cast hex back to uint32 for the parallel placementIds blob — the
+    // viewer reads it as `Uint32Array` and compares against the same hex
+    // string when sending tombstones, so the wire format is the hex string
+    // and the on-disk form is the raw uint32.
+    const hashUint = parseInt(hashHex, 16) >>> 0;
+    for (const draw of expandPlacement(rec.type, rec.rotation)) {
+      const key = `${rec.locId}:${draw.modelType}:${draw.bakedRotation}`;
+      const rb = resolvedByKey.get(key);
+      if (!rb) continue;
+
+      let blockIndex: number;
+      if (rb.contoured) {
+        const origin = clientOriginForPlacement(
+          rec.localX,
+          rec.localY,
+          rec.type,
+          rec.rotation,
+          rb.sizeX,
+          rb.sizeY,
+        );
+        const deformed = deformContouredModel(
+          rb.model,
+          origin.x,
+          origin.z,
+          rec.plane,
+          rb.contouredThreshold,
+          terrainHeights,
+        );
+        const flat = flattenModel(deformed, atlas, rb.ambient, rb.contrast);
+        blockIndex = pushBlock(rb, flat);
+        contouredPlacementCount++;
+      } else {
+        const sharedIndex = sharedBlockByKey.get(key);
+        if (sharedIndex === undefined) continue;
+        blockIndex = sharedIndex;
+      }
+
+      // Phase 2: derived per-placement edge/corner block bits.
+      // `expandPlacement` may have emitted multiple draws per cache
+      // record (e.g. WALL_CORNER → two halves), but each draw is one
+      // LocPlacement and should report the same blockedEdges since
+      // collision is per-cache-record, not per-half. The reference
+      // client does this in `Landscape.java:1017`: it calls `addWall`
+      // once per cache record with both orientations OR'd in.
+      //
+      // `blockingMask` (cache opcode 79) overrides the type-derived
+      // table when set — applies to every draw of the same record.
+      const mask = rb.defFields.blockingMask;
+      const blockedEdges =
+        mask !== undefined && mask !== 0
+          ? mask & 0xff
+          : deriveBlockedEdges(rec.type, rec.rotation);
+
+      placements.push({
+        locId: rec.locId,
+        origType: rec.type,
+        origRotation: rec.rotation,
+        x: rec.localX,
+        z: rec.localY,
+        plane: rec.plane,
+        blockIndex,
+        blockedEdges,
+        ...(rec.offsetX !== undefined && rec.offsetX !== 0 ? { offsetX: rec.offsetX } : {}),
+        ...(rec.offsetZ !== undefined && rec.offsetZ !== 0 ? { offsetZ: rec.offsetZ } : {}),
+        ...(rec.rotationY !== undefined && rec.rotationY !== 0 ? { rotationY: rec.rotationY } : {}),
+      });
+      placementIdsList.push(hashUint);
+    }
+  }
+  const placementIds = new Uint32Array(placementIdsList);
 
   const positions = new Float32Array(posByteCursor / 4);
   const colors = new Uint8Array(colByteCursor);
@@ -1275,6 +1400,8 @@ export function emitLocs(
     uvsFile: "locs.uv.bin",
     framesFile: hasFrames ? "locs.frames.pos.bin" : undefined,
     framesByteLength: hasFrames ? framesPositions.byteLength : undefined,
+    placementIdsFile: "locs.placementIds.bin",
+    placementIdsByteLength: placementIds.byteLength,
     skippedLocIds: Array.from(plan.skippedLocIds).sort((a, b) => a - b),
     ...(morphsJson ? { morphs: morphsJson } : {}),
   };
@@ -1285,11 +1412,16 @@ export function emitLocs(
   const debug: LocsDebug = { schemaVersion: LOCS_DEBUG_SCHEMA, blocks: debugBlocks };
 
   const r = plan.skipReasons;
+  const overlayNote =
+    overlay && (removedCount > 0 || overlay.adds.length > 0)
+      ? ` [overlay: ${removedCount} removed, ${overlay.adds.length} added]`
+      : "";
   console.log(
     `[locs] ${blocks.length} blocks (${contouredPlacementCount} per-placement contoured, ` +
       `${plan.animatedBlockCount} with frame-0 pose baked), ` +
       `${placements.length} placements, ${plan.skippedLocIds.size} locIds skipped ` +
-      `(noDef=${r.noDef} noModel=${r.noModel} empty=${r.emptyModel} err=${r.error})`,
+      `(noDef=${r.noDef} noModel=${r.noModel} empty=${r.emptyModel} err=${r.error})` +
+      overlayNote,
   );
   const t = textureTypeCounts;
   if (t.type1 > 0 || t.type2 > 0 || t.type3 > 0 || t.other > 0) {
@@ -1305,7 +1437,7 @@ export function emitLocs(
       `varbit=${d.varbit} customDecorDisp=${d.customDecorDisplacement} ` +
       `contoured=${d.contoured} (thresholded=${d.contouredThresholded})`,
   );
-  return { manifest, positions, colors, uvs, framesPositions, debug };
+  return { manifest, positions, colors, uvs, framesPositions, placementIds, debug };
 }
 
 export async function writeLocsBundle(baked: BakedLocs, outDir: string): Promise<void> {
@@ -1316,6 +1448,12 @@ export async function writeLocsBundle(baked: BakedLocs, outDir: string): Promise
     await writeFile(
       join(outDir, baked.manifest.framesFile),
       Buffer.from(baked.framesPositions.buffer),
+    );
+  }
+  if (baked.manifest.placementIdsByteLength > 0) {
+    await writeFile(
+      join(outDir, baked.manifest.placementIdsFile),
+      Buffer.from(baked.placementIds.buffer),
     );
   }
   await writeFile(join(outDir, "locs.json"), JSON.stringify(baked.manifest));

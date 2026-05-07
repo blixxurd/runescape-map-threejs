@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { LocsManifest } from "@rsmap/shared";
 import type { PlacedMeshUserData } from "./placerTypes.js";
+import { resolveLocHit } from "./locResolve.js";
 
 /**
  * "Pick from world" tool. Click on anything in the scene while armed and
@@ -143,8 +144,8 @@ export class Eyedropper {
       // to the manifest's locId.
       const region = this.findOwningRegion(obj);
       if (!region) continue;
-      const locId = resolveLocId(obj, region.locsManifest, hit);
-      if (locId !== null) return { kind: "object", id: locId };
+      const locHit = resolveLocHit(hit, region.locsManifest);
+      if (locHit) return { kind: "object", id: locHit.locId };
     }
     return null;
   }
@@ -169,34 +170,3 @@ export class Eyedropper {
   }
 }
 
-/** Raycast hit → locId via the loc manifest, for either the InstancedMesh
- *  or merged-loc variants built by placeLocs. */
-function resolveLocId(
-  obj: THREE.Object3D,
-  manifest: LocsManifest,
-  hit: THREE.Intersection,
-): number | null {
-  // InstancedMesh case: placeLocs sets `userData.placementIdxs`.
-  const placementIdxs = (obj.userData as { placementIdxs?: number[] }).placementIdxs;
-  if (placementIdxs && hit.instanceId !== undefined && hit.instanceId !== null) {
-    const idx = placementIdxs[hit.instanceId];
-    if (idx !== undefined) return locIdFromPlacement(manifest, idx);
-  }
-
-  // Merged-loc case: userData.placementByTri maps faceIndex → placement idx.
-  const placementByTri = (obj.userData as { placementByTri?: Uint32Array }).placementByTri;
-  if (placementByTri && hit.faceIndex !== undefined && hit.faceIndex !== null) {
-    const idx = placementByTri[hit.faceIndex];
-    if (idx !== undefined) return locIdFromPlacement(manifest, idx);
-  }
-
-  return null;
-}
-
-function locIdFromPlacement(manifest: LocsManifest, placementIdx: number): number | null {
-  const placement = manifest.placements[placementIdx];
-  if (!placement) return null;
-  const block = manifest.blocks[placement.blockIndex];
-  if (!block) return null;
-  return block.locId;
-}
