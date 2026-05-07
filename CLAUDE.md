@@ -192,20 +192,40 @@ impacts, gfx-on-NPC); cache `frameStep === -1` is force-promoted to a
 full loop so the editor can show the animation continuously. See
 `memory/editor_tools.md` for the full rundown.
 
-Selection layer (no tool armed → click-to-select an existing placement):
+Selection layer (no tool armed → click-to-select). Two flavours: existing
+*placed* entities get the full editor; *baked* scenery locs from the cache
+get a read-only inspector + Delete (which records a tombstone for the next
+commit).
 
-- `OutlinePass` highlights the selected mesh in cyan.
-- `TransformControls` gizmo: `T` for translate (XZ ground-plane only — Y
-  re-clamps to terrain on every drag), `R` for rotate around Y. Snaps to 45°,
-  hold Shift for free angle.
+- `OutlinePass` highlights the selected mesh in cyan. Baked-loc selections
+  use a single-instance "outline ghost" so the cyan edge is on just the
+  clicked instance, not every sibling in the InstancedMesh.
+- `TransformControls` gizmo: `T` for translate (X/Y/Z all visible — Y
+  bypasses the surface clamp and writes through to the placement's
+  `offsetY` so manual lifts persist), `R` for rotate around Y. Snaps to
+  45°, hold Shift for free angle. **Listen to `objectChange`, not `change`**
+  — see `memory/tc_change_vs_objectchange.md`.
 - Floating inspector panel: numeric X/Z/rotation, ±45° steppers, NPC
   animation override, Delete + Duplicate.
 - Keyboard: Esc deselect, Delete/Backspace remove, Cmd/Ctrl+D duplicate,
   arrow keys nudge by `TILE_SIZE` (Shift+arrow for 1-unit fine).
-- Arming any placer auto-deselects (the gizmo and a placement ghost can't
-  cohabit the canvas without confusing the click target).
+- Arming any placer auto-deselects.
 
-The editor is session-only — placements live in scene memory, no persistence.
+**Commit-edits persistence.** The "commit" button in the editor head bar
+POSTs each affected region's diff to `/api/dev/commit-edits?region=<id>`,
+which merges the diff into `packages/extractor/edits/<regionId>.json`
+(checked into git as source data) and re-runs `extractRegion`. The
+viewer then reloads the region from the freshly-baked bundle.
+`LocPlacement.offsetX/Z/Y` + `rotationY` round-trip sub-tile precision
+and non-cardinal rotation losslessly. **v1 scope:** Object adds +
+baked-loc removes only — NPCs/items/FX stay session-only. "Move a baked
+loc" isn't supported (delete + re-add). See `memory/editor_tools.md`
+for the full architecture.
+
+**Obey-geometry ("stack") toggle.** When on, the placer + gizmo raycast
+loc groups + every placer's scene group on top of terrain, so placements
+rest on whatever's under the cursor. Object stacks survive commit via
+`LocPlacement.offsetY`. NPC/item/FX stacks are session-only.
 
 ## Debug inspector
 
