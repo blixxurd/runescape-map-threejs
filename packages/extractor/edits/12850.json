@@ -1829,6 +1829,18 @@
       "animationOverride": null,
       "offsetX": 55.87827085833487,
       "offsetZ": 39.75484132881729
+    },
+    {
+      "locId": 46231,
+      "plane": 0,
+      "tileX": 21,
+      "tileZ": 50,
+      "type": 10,
+      "rotation": 0,
+      "animationOverride": null,
+      "offsetX": -24.132506413960073,
+      "offsetZ": -32.387201153432216,
+      "rotationY": -0.7853981633974483
     }
   ]
 }
