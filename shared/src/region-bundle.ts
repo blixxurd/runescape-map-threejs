@@ -15,6 +15,7 @@ export const TILES_PER_SIDE = 64;
 export const VERTICES_PER_SIDE = TILES_PER_SIDE + 1;
 export const PLANES = 4;
 export const TILE_SIZE = 128;
+export const REGION_SPAN = TILES_PER_SIDE * TILE_SIZE;
 
 /**
  * Schema versions for each on-disk artifact. The viewer's loader compares

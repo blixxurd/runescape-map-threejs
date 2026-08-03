@@ -89,3 +89,75 @@ describe("region file helpers", () => {
     expect(isRegionFileEmpty(f)).toBe(false);
   });
 });
+
+import { REGION_SPAN } from "@rsmap/shared";
+import {
+  regionLocalToWorld,
+  regionOriginFor,
+  worldToRegionId,
+  worldToRegionLocal,
+} from "./saveModel.js";
+
+// Lumbridge 12850 = (regionX 50, regionZ 50). Used as the streaming centre
+// in every case below, so its own origin is the world origin.
+const CX = 50;
+const CZ = 50;
+
+describe("regionOriginFor", () => {
+  it("puts the centre region at the world origin", () => {
+    expect(regionOriginFor(12850, CX, CZ)).toEqual({ offsetX: 0, offsetZ: 0 });
+  });
+
+  it("puts the region one step east at +X", () => {
+    // regionX 51, regionZ 50 → (51 << 8) | 50
+    expect(regionOriginFor((51 << 8) | 50, CX, CZ)).toEqual({
+      offsetX: REGION_SPAN,
+      offsetZ: 0,
+    });
+  });
+
+  it("puts the region one step north at -Z (cache +Y is world -Z)", () => {
+    expect(regionOriginFor((50 << 8) | 51, CX, CZ)).toEqual({
+      offsetX: 0,
+      offsetZ: -REGION_SPAN,
+    });
+  });
+});
+
+describe("worldToRegionId", () => {
+  it("attributes a position inside the centre region", () => {
+    expect(worldToRegionId(100, -100, CX, CZ)).toBe(12850);
+  });
+
+  it("attributes a position just across the east seam to the east region", () => {
+    expect(worldToRegionId(REGION_SPAN + 1, -100, CX, CZ)).toBe((51 << 8) | 50);
+  });
+
+  it("attributes a position just across the north seam to the north region", () => {
+    expect(worldToRegionId(100, -REGION_SPAN - 1, CX, CZ)).toBe((50 << 8) | 51);
+  });
+
+  it("returns null outside the addressable cache grid", () => {
+    expect(worldToRegionId(-100 * REGION_SPAN, 0, CX, CZ)).toBeNull();
+  });
+});
+
+describe("region-local round trip", () => {
+  it("recovers the original world position", () => {
+    const world = { x: REGION_SPAN + 250.5, y: 37.25, z: -REGION_SPAN - 900.75 };
+    const regionId = worldToRegionId(world.x, world.z, CX, CZ)!;
+    const origin = regionOriginFor(regionId, CX, CZ);
+    const local = worldToRegionLocal(world, origin);
+    expect(regionLocalToWorld(local, origin)).toEqual(world);
+  });
+
+  it("keeps local coordinates inside one region span", () => {
+    const world = { x: REGION_SPAN + 250.5, y: 0, z: -REGION_SPAN - 900.75 };
+    const regionId = worldToRegionId(world.x, world.z, CX, CZ)!;
+    const local = worldToRegionLocal(world, regionOriginFor(regionId, CX, CZ));
+    expect(local.x).toBeGreaterThanOrEqual(0);
+    expect(local.x).toBeLessThan(REGION_SPAN);
+    expect(local.z).toBeLessThanOrEqual(0);
+    expect(local.z).toBeGreaterThan(-REGION_SPAN);
+  });
+});
