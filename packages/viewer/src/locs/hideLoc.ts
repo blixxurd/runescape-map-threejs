@@ -16,7 +16,7 @@ import * as THREE from "three";
 
 /** Y depth to sink hidden geometry to. Far below any terrain, so a
  *  degenerate triangle can never poke back into view. */
-export const SUNK_Y = -100000;
+export const SUNK_Y = -1e6;
 
 /** Zero-scale a single InstancedMesh slot and sink it underground. The
  *  slot stays allocated; the per-instance matrix is degenerate so the
