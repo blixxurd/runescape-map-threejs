@@ -58,12 +58,6 @@ interface RegionSlice {
   placements: Set<SavedPlacement>;
 }
 
-/** Meshes spawned by `applyToRegion` carry this so `detachRegion` can find
- *  them again without consulting the store. */
-interface SaveMeshUserData {
-  saveRegionId?: number;
-}
-
 export interface ApplyResult {
   hidden: number;
   spawned: number;
@@ -75,6 +69,14 @@ export class SaveStore {
   private readonly host: SaveStoreHost;
   private readonly byRegion = new Map<number, RegionSlice>();
   private readonly byMesh = new Map<THREE.Mesh, { regionId: number; data: SavedPlacement }>();
+  /** Regions with an `applyToRegion` call currently in flight. Guards
+   *  against a second apply starting for the same region before the first
+   *  one's spawn chain finishes — see the comment in `applyToRegion`. */
+  private readonly applying = new Set<number>();
+  /** Bumped by `detachRegion` for the region it unloads. Lets an in-flight
+   *  `applyToRegion` notice, after each await, that the region it's
+   *  spawning into has since gone away — see `applyToRegion`. */
+  private readonly generation = new Map<number, number>();
   private dirty = false;
   private slug: string | null = null;
   private name: string | null = null;
@@ -127,6 +129,10 @@ export class SaveStore {
   private touched(): void {
     this.dirty = true;
     this.onChange?.();
+  }
+
+  private generationFor(regionId: number): number {
+    return this.generation.get(regionId) ?? 0;
   }
 
   /** Region + local coords for a world position, or null when the position
@@ -232,48 +238,72 @@ export class SaveStore {
     if (!slice) return result;
     const loaded = this.host.getLoadedRegion(regionId);
     if (!loaded) return result;
+    // Guard (a): bail if this region already has an apply in flight. Without
+    // this, fast pan-away-and-back can start a second `applyToRegion` for
+    // the same region while the first is still awaiting spawns, aliasing
+    // one `SavedPlacement` to two meshes.
+    if (this.applying.has(regionId)) return result;
+    this.applying.add(regionId);
+    // Snapshot the region's generation. `detachRegion` bumps it when the
+    // region unloads. If it moves while we're mid-await below, this apply
+    // is stale — the region left (and maybe came back) since we started,
+    // so a mesh spawned under the old generation must not be registered:
+    // nothing will ever call `detachRegion` for *this* spawn again, so a
+    // registered stray would leak forever. Guard (b), checked after every
+    // await in the spawn loop.
+    const generation = this.generationFor(regionId);
 
-    if (slice.removes.size > 0) {
-      const index = buildPlacementIndex(loaded.locsGroup);
-      if (index.size === 0) {
-        console.warn(
-          `[saves] region ${regionId} bundle has no placementIds — ${slice.removes.size} removes skipped (re-extract to upgrade)`,
-        );
+    try {
+      if (slice.removes.size > 0) {
+        const index = buildPlacementIndex(loaded.locsGroup);
+        if (index.size === 0) {
+          console.warn(
+            `[saves] region ${regionId} bundle has no placementIds — ${slice.removes.size} removes skipped (re-extract to upgrade)`,
+          );
+        }
+        for (const hex of slice.removes) {
+          const slot = index.get(hex);
+          if (!slot) continue;
+          hideSlot(slot);
+          result.hidden++;
+        }
       }
-      for (const hex of slice.removes) {
-        const slot = index.get(hex);
-        if (!slot) continue;
-        hideSlot(slot);
-        result.hidden++;
-      }
-    }
 
-    const origin = { offsetX: loaded.offsetX, offsetZ: loaded.offsetZ };
-    // Spawn sequentially per placement but let identical ids share one
-    // fetch — the placer's own cache handles that, so a plain loop is
-    // enough and keeps ordering deterministic.
-    for (const data of slice.placements) {
-      const placer = this.host.placerFor(data.kind);
-      if (!placer) {
-        result.skipped++;
-        continue;
+      const origin = { offsetX: loaded.offsetX, offsetZ: loaded.offsetZ };
+      // Spawn sequentially per placement but let identical ids share one
+      // fetch — the placer's own cache handles that, so a plain loop is
+      // enough and keeps ordering deterministic.
+      for (const data of slice.placements) {
+        const placer = this.host.placerFor(data.kind);
+        if (!placer) {
+          result.skipped++;
+          continue;
+        }
+        const world = regionLocalToWorld(data, origin);
+        const mesh = await placer.spawnAt({
+          id: data.id,
+          position: world,
+          rotationY: data.rotationY,
+          plane: data.plane,
+          animationOverride: data.animationOverride ?? null,
+          notify: false,
+        });
+        if (!mesh) {
+          result.skipped++;
+          continue;
+        }
+        if (this.generationFor(regionId) !== generation) {
+          // Region detached while `spawnAt` was in flight — discard the
+          // orphaned mesh instead of registering it (see guard (b) above).
+          placer.removeMesh(mesh);
+          result.skipped++;
+          continue;
+        }
+        this.byMesh.set(mesh, { regionId, data });
+        result.spawned++;
       }
-      const world = regionLocalToWorld(data, origin);
-      const mesh = await placer.spawnAt({
-        id: data.id,
-        position: world,
-        rotationY: data.rotationY,
-        plane: data.plane,
-        animationOverride: data.animationOverride ?? null,
-        notify: false,
-      });
-      if (!mesh) {
-        result.skipped++;
-        continue;
-      }
-      (mesh.userData as SaveMeshUserData).saveRegionId = regionId;
-      this.byMesh.set(mesh, { regionId, data });
-      result.spawned++;
+    } finally {
+      this.applying.delete(regionId);
     }
     return result;
   }
@@ -294,6 +324,7 @@ export class SaveStore {
    * mesh from the scene. Do not reorder these two lines.
    */
   detachRegion(regionId: number): void {
+    this.generation.set(regionId, this.generationFor(regionId) + 1);
     for (const [mesh, tracked] of [...this.byMesh]) {
       if (tracked.regionId !== regionId) continue;
       this.byMesh.delete(mesh);
@@ -347,7 +378,7 @@ export class SaveStore {
     for (const [regionId, slice] of this.byRegion) {
       const file = emptyRegionFile(regionId);
       file.removes = [...slice.removes].sort();
-      file.placements = [...slice.placements];
+      file.placements = [...slice.placements].map((p) => ({ ...p }));
       if (!isRegionFileEmpty(file)) regions.push(file);
     }
     regions.sort((a, b) => a.regionId - b.regionId);

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import { REGION_SPAN } from "@rsmap/shared";
 import { SAVE_SCHEMA } from "@rsmap/shared/save-file";
+import type { SaveBundle, SavedPlacementKind } from "@rsmap/shared/save-file";
 import { SaveStore } from "./saveStore.js";
 import type { SaveStoreHost } from "./saveStore.js";
 import type { Placer, PlacerKind } from "../tools/placerTypes.js";
@@ -170,5 +171,145 @@ describe("SaveStore detachRegion re-entrancy", () => {
 
     const bundle = store.serialize({ name: "T", slug: "t" });
     expect(bundle.regions.find((r) => r.regionId === 12850)?.placements).toHaveLength(1);
+  });
+});
+
+describe("SaveStore applyToRegion", () => {
+  function locStub(locsGroup: THREE.Object3D = new THREE.Group()) {
+    return { offsetX: 0, offsetZ: 0, locsGroup };
+  }
+
+  function stubPlacer(overrides: Partial<Placer> = {}): Placer {
+    return {
+      kind: "npc" as PlacerKind,
+      getSceneGroup: () => new THREE.Group(),
+      getPlacements: () => [],
+      updatePose: () => {},
+      removeMesh: () => {},
+      duplicate: () => {},
+      spawnAt: async () => null,
+      isArmed: () => false,
+      cancel: () => {},
+      ...overrides,
+    };
+  }
+
+  /** Minimal single-region bundle, enough to exercise `applyToRegion`
+   *  without going through `trackSpawn` (which would dirty the store). */
+  function bundleWith(
+    regionId: number,
+    placements: Array<{ kind: SavedPlacementKind; id: number }>,
+    removes: string[] = [],
+  ): SaveBundle {
+    return {
+      manifest: {
+        schemaVersion: SAVE_SCHEMA,
+        name: "T",
+        slug: "t",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        regions: [regionId],
+      },
+      regions: [
+        {
+          schemaVersion: SAVE_SCHEMA,
+          regionId,
+          removes,
+          placements: placements.map((p) => ({
+            kind: p.kind,
+            id: p.id,
+            plane: 0,
+            x: 100,
+            y: 0,
+            z: -100,
+            rotationY: 0,
+          })),
+        },
+      ],
+    };
+  }
+
+  it("counts a placement as skipped when no placer owns its kind", async () => {
+    const store = new SaveStore(
+      makeHost({ getLoadedRegion: () => locStub(), placerFor: () => null }),
+    );
+    store.load(
+      bundleWith(12850, [
+        { kind: "npc", id: 1 },
+        { kind: "object", id: 2 },
+      ]),
+    );
+
+    const result = await store.applyToRegion(12850);
+
+    expect(result).toEqual({ hidden: 0, spawned: 0, skipped: 2 });
+  });
+
+  it("spawns what it can, skips placements whose entity fails to bake, and does not go dirty", async () => {
+    const placer = stubPlacer({
+      spawnAt: async (opts) => (opts.id === 1 ? meshAt(100, 0, -100) : null),
+    });
+    const store = new SaveStore(
+      makeHost({ getLoadedRegion: () => locStub(), placerFor: () => placer }),
+    );
+    store.load(
+      bundleWith(12850, [
+        { kind: "npc", id: 1 },
+        { kind: "npc", id: 2 },
+      ]),
+    );
+    expect(store.isDirty()).toBe(false);
+
+    const result = await store.applyToRegion(12850);
+
+    expect(result).toEqual({ hidden: 0, spawned: 1, skipped: 1 });
+    // Re-materializing a saved placement is not an edit.
+    expect(store.isDirty()).toBe(false);
+  });
+
+  it("guards against a second apply starting before the first finishes", async () => {
+    let resolveSpawn: (mesh: THREE.Mesh | null) => void = () => {};
+    const spawnPromise = new Promise<THREE.Mesh | null>((res) => {
+      resolveSpawn = res;
+    });
+    const spawnAt = vi.fn(() => spawnPromise);
+    const placer = stubPlacer({ spawnAt });
+    const store = new SaveStore(
+      makeHost({ getLoadedRegion: () => locStub(), placerFor: () => placer }),
+    );
+    store.load(bundleWith(12850, [{ kind: "npc", id: 1 }]));
+
+    // Don't await the first call — start the second while the first is
+    // still suspended on `await placer.spawnAt(...)`.
+    const p1 = store.applyToRegion(12850);
+    const p2 = store.applyToRegion(12850);
+    resolveSpawn(meshAt(100, 0, -100));
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    // Only one spawn chain ever ran — the second call bailed at entry.
+    expect(spawnAt).toHaveBeenCalledTimes(1);
+    expect(r1).toEqual({ hidden: 0, spawned: 1, skipped: 0 });
+    expect(r2).toEqual({ hidden: 0, spawned: 0, skipped: 0 });
+  });
+
+  it("hides a baked loc whose placement id matches a saved remove", async () => {
+    // Same fixture shape as hideLoc.test.ts: placementIds + placementIdxs
+    // stamped on an InstancedMesh by placeLocs.
+    const inst = new THREE.InstancedMesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial(),
+      1,
+    );
+    inst.userData.placementIds = new Uint32Array([0x1a]);
+    inst.userData.placementIdxs = [0];
+    const locsGroup = new THREE.Group();
+    locsGroup.add(inst);
+
+    const store = new SaveStore(makeHost({ getLoadedRegion: () => locStub(locsGroup) }));
+    store.addRemove(12850, "0000001a");
+
+    const result = await store.applyToRegion(12850);
+
+    expect(result).toEqual({ hidden: 1, spawned: 0, skipped: 0 });
   });
 });
