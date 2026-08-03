@@ -102,12 +102,17 @@ export async function writeSave(bundle: SaveBundle): Promise<void> {
   }
 }
 
+/** Returns `false` when the save doesn't exist. Any other failure (permission,
+ *  disk I/O, etc.) is a real error and propagates — swallowing it would
+ *  misreport a genuine failure as "not found" and send the caller chasing
+ *  the wrong problem. */
 export async function deleteSave(slug: string): Promise<boolean> {
   const dir = saveDir(slug);
   try {
     await rm(dir, { recursive: true });
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
   }
 }

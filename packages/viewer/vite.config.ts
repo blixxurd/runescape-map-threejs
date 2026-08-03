@@ -222,6 +222,26 @@ function autoExtractPlugin(): Plugin {
     await job;
   }
 
+  /** Per-slug mutex. `writeSave` is multi-step (write region files → write
+   *  manifest → prune stale files) and `deleteSave` removes the whole
+   *  directory — two overlapping requests for the same slug (a
+   *  double-clicked Save, or a Save racing a Delete) could otherwise
+   *  interleave those steps and leave the manifest naming a region file a
+   *  concurrent op just deleted. Mirrors `commitMutex` above for the same
+   *  reason. */
+  const saveMutex = new Map<string, Promise<unknown>>();
+
+  async function withSaveMutex<T>(slug: string, run: () => Promise<T>): Promise<T> {
+    const prev = saveMutex.get(slug) ?? Promise.resolve();
+    const job = prev.then(run);
+    // Don't poison future ops on this slug if this one fails.
+    saveMutex.set(
+      slug,
+      job.catch(() => undefined),
+    );
+    return job;
+  }
+
   async function getNpcCatalog(server: ViteDevServer): Promise<NpcCatalogEntry[]> {
     if (npcCatalogPromise) return npcCatalogPromise;
     npcCatalogPromise = (async (): Promise<NpcCatalogEntry[]> => {
@@ -539,13 +559,13 @@ function autoExtractPlugin(): Plugin {
                 });
                 return;
               }
-              await mod.writeSave(body as never);
+              await withSaveMutex(slug, () => mod.writeSave(body as never));
               server.config.logger.info(`[saves] wrote ${slug}`);
               writeJson(res, 200, { ok: true, slug });
               return;
             }
             if (req.method === "DELETE") {
-              const ok = await mod.deleteSave(slug);
+              const ok = await withSaveMutex(slug, () => mod.deleteSave(slug));
               writeJson(res, ok ? 200 : 404, ok ? { ok: true, slug } : { error: "not found" });
               return;
             }
