@@ -16,6 +16,10 @@ import type {
   buildSequenceCatalog as BuildSequenceCatalogFn,
   buildGlobalAtlas as BuildGlobalAtlasFn,
   mergeAndSaveEdits as MergeAndSaveEditsFn,
+  listSaves as ListSavesFn,
+  readSave as ReadSaveFn,
+  writeSave as WriteSaveFn,
+  deleteSave as DeleteSaveFn,
   BakedAtlas,
   NpcCatalogEntry,
   ObjectCatalogEntry,
@@ -75,6 +79,10 @@ function autoExtractPlugin(): Plugin {
     buildSequenceCatalog: typeof BuildSequenceCatalogFn;
     buildGlobalAtlas: typeof BuildGlobalAtlasFn;
     mergeAndSaveEdits: typeof MergeAndSaveEditsFn;
+    listSaves: typeof ListSavesFn;
+    readSave: typeof ReadSaveFn;
+    writeSave: typeof WriteSaveFn;
+    deleteSave: typeof DeleteSaveFn;
   }
 
   let extractorModule: ExtractorModule | null = null;
@@ -482,6 +490,69 @@ function autoExtractPlugin(): Plugin {
               `[auto-extract] region ${regionId} failed: ${(err as Error).message}`,
             );
             writeJson(res, 500, { error: (err as Error).message, regionId });
+          }
+          return;
+        }
+
+        if (req.url === "/api/dev/saves" || req.url.startsWith("/api/dev/saves?")) {
+          const mod = await loadModule(server);
+          try {
+            writeJson(res, 200, { saves: await mod.listSaves() });
+          } catch (err) {
+            writeJson(res, 500, { error: (err as Error).message });
+          }
+          return;
+        }
+
+        if (req.url.startsWith("/api/dev/saves/")) {
+          const slug = decodeURIComponent(
+            new URL(req.url, "http://localhost").pathname.slice("/api/dev/saves/".length),
+          );
+          if (!/^[a-z0-9-]+$/.test(slug)) {
+            writeJson(res, 400, { error: `invalid save slug: ${slug}` });
+            return;
+          }
+          const mod = await loadModule(server);
+          try {
+            if (req.method === "GET") {
+              const bundle = await mod.readSave(slug);
+              if (!bundle) {
+                writeJson(res, 404, { error: `no such save: ${slug}` });
+                return;
+              }
+              writeJson(res, 200, bundle);
+              return;
+            }
+            if (req.method === "PUT") {
+              const body = await readJsonBody(req);
+              // writeSave re-parses and throws on anything malformed, so
+              // the endpoint doesn't duplicate field validation — but the
+              // URL slug is the caller's routing intent, and writeSave
+              // files under `body.manifest.slug` instead. Reject a
+              // mismatch rather than silently writing to a different
+              // directory than the URL says.
+              const bodySlug = (body as { manifest?: { slug?: unknown } } | null)?.manifest
+                ?.slug;
+              if (bodySlug !== slug) {
+                writeJson(res, 400, {
+                  error: `body manifest.slug (${JSON.stringify(bodySlug)}) does not match URL slug "${slug}"`,
+                });
+                return;
+              }
+              await mod.writeSave(body as never);
+              server.config.logger.info(`[saves] wrote ${slug}`);
+              writeJson(res, 200, { ok: true, slug });
+              return;
+            }
+            if (req.method === "DELETE") {
+              const ok = await mod.deleteSave(slug);
+              writeJson(res, ok ? 200 : 404, ok ? { ok: true, slug } : { error: "not found" });
+              return;
+            }
+            writeJson(res, 405, { error: "GET, PUT or DELETE required" });
+          } catch (err) {
+            server.config.logger.error(`[saves] ${slug} failed: ${(err as Error).message}`);
+            writeJson(res, 400, { error: (err as Error).message });
           }
           return;
         }

@@ -24,6 +24,7 @@ export {
   placementHash,
   EDITS_DIR,
 } from "./region/edits.js";
+export { listSaves, readSave, writeSave, deleteSave } from "./saves/store.js";
 import { buildAtlas, writeAtlas } from "./texture/atlas.js";
 import { patchObjectLoader, getObjectLoaderFailureCount } from "./patches/objectLoader.js";
 import { patchFloorLoaders } from "./patches/floorLoaders.js";
