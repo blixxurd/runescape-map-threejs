@@ -8,6 +8,7 @@ import { TILE_SIZE } from "@rsmap/shared";
 import type { Placer, PlacedRef } from "./placerTypes.js";
 import { resolveLocHit, type LocHit } from "./locResolve.js";
 import type { PendingEdits } from "./pendingEdits.js";
+import { SUNK_Y, hideInstancedSlot, hideMergedTriangles } from "../locs/hideLoc.js";
 
 /**
  * Selection: click-to-select either a user-placed entity (NPC / object /
@@ -535,11 +536,6 @@ function findOwningRegion(
   return null;
 }
 
-/** Sentinel Y used when hiding loc geometry pre-commit. Placing degenerate
- *  triangles deep underground keeps them out of any plausible camera view
- *  and well clear of the (0,0,0) world origin where stray hits would be
- *  most surprising. */
-const SUNK_Y = -1e6;
 
 /** Outline-ghost record — see Selection.outlineGhost. Discriminated by
  *  source mesh kind so restore knows whether to re-set an instance matrix
@@ -699,35 +695,4 @@ function makeOutlineGhost(locHit: LocHit): OutlineGhost | null {
   return null;
 }
 
-/** Zero-scale a single InstancedMesh slot and sink it underground. The
- *  slot stays allocated; the per-instance matrix is degenerate so the
- *  fragment shader produces no output and raycasts find no hit. */
-function hideInstancedSlot(inst: THREE.InstancedMesh, instanceId: number): void {
-  const m = new THREE.Matrix4();
-  m.makeScale(0, 0, 0);
-  m.setPosition(0, SUNK_Y, 0);
-  inst.setMatrixAt(instanceId, m);
-  inst.instanceMatrix.needsUpdate = true;
-}
 
-/** Collapse every triangle owned by `placementIdx` in a merged-loc Mesh's
- *  position buffer to a single point at SUNK_Y. The merged buffer is
- *  owned by this mesh alone (`placeLocs` mints a fresh Float32Array) so
- *  in-place mutation doesn't affect any other placement. */
-function hideMergedTriangles(mesh: THREE.Mesh, placementIdx: number): void {
-  const placementByTri = (mesh.userData as { placementByTri?: Uint32Array })
-    .placementByTri;
-  if (!placementByTri) return;
-  const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
-  const positions = posAttr.array as Float32Array;
-  for (let t = 0; t < placementByTri.length; t++) {
-    if (placementByTri[t] !== placementIdx) continue;
-    // Each triangle = 3 vertices = 9 floats. Collapse all three vertices
-    // to (0, SUNK_Y, 0) — degenerate zero-area, no rasterised fragments.
-    const off = t * 9;
-    positions[off + 0] = 0; positions[off + 1] = SUNK_Y; positions[off + 2] = 0;
-    positions[off + 3] = 0; positions[off + 4] = SUNK_Y; positions[off + 5] = 0;
-    positions[off + 6] = 0; positions[off + 7] = SUNK_Y; positions[off + 8] = 0;
-  }
-  posAttr.needsUpdate = true;
-}
