@@ -45,6 +45,21 @@ export interface PlacedRef {
   availableAnimations?: Array<{ id: number; label: string }>;
 }
 
+/** Options for `Placer.spawnAt` — a world pose spawn that bypasses the
+ *  armed-tool click flow. Used by the save store to re-materialize saved
+ *  placements on region load, and by the legacy-edits importer. */
+export interface SpawnAtOptions {
+  id: number;
+  position: { x: number; y: number; z: number };
+  rotationY: number;
+  plane: number;
+  animationOverride?: number | null;
+  /** When false, `onPlacementSpawned` does NOT fire. Save-apply passes
+   *  false so re-materializing a saved placement isn't recorded as a new
+   *  edit. Defaults to true. */
+  notify?: boolean;
+}
+
 export interface Placer {
   readonly kind: PlacerKind;
   /** Scene group holding every placed mesh for this placer. Selection's
@@ -66,6 +81,9 @@ export interface Placer {
   removeMesh(mesh: THREE.Mesh): void;
   /** Clone a placement at the same pose. */
   duplicate(mesh: THREE.Mesh): void;
+  /** Spawn a placement at an exact world pose, bypassing the armed-tool
+   *  flow. Resolves null when the entity can't be baked. */
+  spawnAt(opts: SpawnAtOptions): Promise<THREE.Mesh | null>;
   /** Swap the animation on a placed entity (NPC-only today; placers without
    *  the capability omit the method). */
   swapAnimation?(mesh: THREE.Mesh, animationId: number): Promise<void>;

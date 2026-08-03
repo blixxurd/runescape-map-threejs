@@ -5,6 +5,7 @@ import type {
   PlacedRef,
   Placer,
   PlacerKind,
+  SpawnAtOptions,
 } from "./placerTypes.js";
 
 /**
@@ -579,6 +580,38 @@ export class ModelPlacer implements Placer {
     });
   }
 
+  /**
+   * Spawn a placement at an exact world pose without arming the tool.
+   * Used by the save store to re-materialize saved placements on region
+   * load, and by the legacy-edits importer.
+   *
+   * Resolves to the new mesh, or null when the entity can't be baked
+   * (unknown id on the current cache build, dev endpoint down). Callers
+   * count nulls and surface them — a missing entity must never abort the
+   * rest of the load.
+   */
+  async spawnAt(opts: SpawnAtOptions): Promise<THREE.Mesh | null> {
+    let baked: CachedEntity;
+    try {
+      baked = await this.getOrFetch(opts.id, opts.animationOverride ?? undefined);
+    } catch (err) {
+      console.warn(`[${this.kind}] spawnAt ${opts.id} failed:`, err);
+      return null;
+    }
+    const placement = this.spawnPlacement(
+      opts.id,
+      baked.name,
+      baked,
+      {
+        position: new THREE.Vector3(opts.position.x, opts.position.y, opts.position.z),
+        rotationRad: opts.rotationY,
+      },
+      opts.plane,
+      opts.notify ?? true,
+    );
+    return placement.mesh;
+  }
+
   /** Swap the animation on an existing placement. Re-fetches via the bake
    *  cache (keyed per `(id, animationId)` so each variant is built once),
    *  rebuilds the placement's geometry around the new frames, and resets
@@ -834,6 +867,8 @@ export class ModelPlacer implements Placer {
     name: string,
     baked: CachedEntity,
     pose: { position: THREE.Vector3; rotationRad: number },
+    plane: number = this.placementPlane,
+    notify = true,
   ): PlacedEntity {
     const { geom, owns } = this.buildGeometryFor(baked, pose);
     const mesh = new THREE.Mesh(geom, this.material);
@@ -851,7 +886,7 @@ export class ModelPlacer implements Placer {
       mesh,
       id,
       name,
-      plane: this.placementPlane,
+      plane,
       cached: baked,
       ownsGeometry: owns,
       animationId: baked.activeAnimationId,
@@ -867,15 +902,17 @@ export class ModelPlacer implements Placer {
     }
     this.placed.push(placement);
     this.onPlacementsChanged?.(this.placed.length);
-    this.onPlacementSpawned?.(
-      mesh,
-      id,
-      name,
-      baked.modelType,
-      baked.sizeX,
-      baked.sizeY,
-      this.placementPlane,
-    );
+    if (notify) {
+      this.onPlacementSpawned?.(
+        mesh,
+        id,
+        name,
+        baked.modelType,
+        baked.sizeX,
+        baked.sizeY,
+        plane,
+      );
+    }
     return placement;
   }
 
