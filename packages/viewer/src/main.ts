@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
+  REGION_SPAN,
   TILE_SIZE,
   TILES_PER_SIDE,
   VERTICES_PER_SIDE,
@@ -41,7 +42,6 @@ const MAX_PLANE = 3;
  * see `docs/scaling.md`.
  */
 const NEIGHBOR_RADIUS = 1;
-const REGION_SPAN = TILES_PER_SIDE * TILE_SIZE;
 
 const hud = document.getElementById("hud")!;
 const setHud = (text: string): void => {
