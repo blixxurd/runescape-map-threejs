@@ -292,6 +292,40 @@ describe("SaveStore applyToRegion", () => {
     expect(r2).toEqual({ hidden: 0, spawned: 0, skipped: 0 });
   });
 
+  it("does not double-spawn a placement whose mesh is already live when its region streams in", async () => {
+    // Reproduces: user drags/nudges a tracked placement out of the loaded
+    // grid. updateFromMesh re-keys it to the destination region while the
+    // original mesh stays registered in byMesh. If that region only *now*
+    // streams in (applyToRegion runs unconditionally on every region load,
+    // main.ts:885), a naive spawn loop would materialize a second mesh for
+    // the same SavedPlacement — aliasing one record to two live meshes.
+    const spawnAt = vi.fn(async () => meshAt(0, 0, 0));
+    const placer = stubPlacer({ spawnAt, removeMesh: vi.fn() });
+    const store = new SaveStore(
+      makeHost({ getLoadedRegion: () => locStub(), placerFor: () => placer }),
+    );
+    const mesh = meshAt(100, 0, -100);
+    store.trackSpawn(mesh, { kind: "npc", id: 3105, plane: 0 });
+
+    // Drag the mesh into EAST_REGION — updateFromMesh re-keys the tracked
+    // record there even though EAST_REGION was never "loaded" for this test.
+    mesh.position.x = REGION_SPAN + 50;
+    store.updateFromMesh(mesh);
+
+    // EAST_REGION "streams in" — applyToRegion must recognize the record
+    // already has a live mesh and skip it rather than spawning a duplicate.
+    const result = await store.applyToRegion(EAST_REGION);
+
+    expect(result).toEqual({ hidden: 0, spawned: 0, skipped: 0 });
+    expect(spawnAt).not.toHaveBeenCalled();
+
+    // Only one mesh is registered for the record: detaching the region
+    // removes exactly the original mesh, once.
+    store.detachRegion(EAST_REGION);
+    expect(placer.removeMesh).toHaveBeenCalledTimes(1);
+    expect(placer.removeMesh).toHaveBeenCalledWith(mesh);
+  });
+
   it("hides a baked loc whose placement id matches a saved remove", async () => {
     // Same fixture shape as hideLoc.test.ts: placementIds + placementIdxs
     // stamped on an InstancedMesh by placeLocs.

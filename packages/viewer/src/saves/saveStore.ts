@@ -270,10 +270,22 @@ export class SaveStore {
       }
 
       const origin = { offsetX: loaded.offsetX, offsetZ: loaded.offsetZ };
+      // Guard (c): a placement can already have a live mesh under this exact
+      // `SavedPlacement` record even though we're only now applying its
+      // region — e.g. the user dragged/nudged it out of the loaded grid,
+      // `updateFromMesh` re-keyed it into `regionId`'s slice while the
+      // original mesh stayed live in `byMesh`, and the region only now
+      // streams in. Without this check we'd spawn a second mesh aliased to
+      // the same record, breaking the "one SavedPlacement ↔ at most one
+      // live mesh" invariant `detachRegion`/`untrack` depend on. Snapshot
+      // once before the loop — nothing in the loop body mutates `byMesh`
+      // for a record that's already live.
+      const live = new Set([...this.byMesh.values()].map((v) => v.data));
       // Spawn sequentially per placement but let identical ids share one
       // fetch — the placer's own cache handles that, so a plain loop is
       // enough and keeps ordering deterministic.
       for (const data of slice.placements) {
+        if (live.has(data)) continue;
         const placer = this.host.placerFor(data.kind);
         if (!placer) {
           result.skipped++;
