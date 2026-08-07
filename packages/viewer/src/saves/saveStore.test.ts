@@ -103,6 +103,40 @@ describe("SaveStore dirty state", () => {
     store.markClean();
     expect(store.isDirty()).toBe(false);
   });
+
+  it("markDirty flags the store without touching its contents", () => {
+    const store = new SaveStore(makeHost());
+    const spy = vi.fn();
+    store.onChange = spy;
+    expect(store.isDirty()).toBe(false);
+
+    store.markDirty();
+
+    expect(store.isDirty()).toBe(true);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(store.serialize({ name: "T", slug: "t" }).regions).toHaveLength(0);
+  });
+
+  it("load() leaves the store clean even after a prior markDirty", () => {
+    // Import (the map menu's only markDirty caller) always calls load()
+    // first — this just confirms load()'s own "clean" contract still
+    // holds and isn't accidentally flipped by an earlier markDirty call
+    // reusing the same store instance.
+    const store = new SaveStore(makeHost());
+    store.markDirty();
+    store.load({
+      manifest: {
+        schemaVersion: SAVE_SCHEMA,
+        name: "T",
+        slug: "t",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        regions: [],
+      },
+      regions: [],
+    });
+    expect(store.isDirty()).toBe(false);
+  });
 });
 
 describe("SaveStore serialization", () => {

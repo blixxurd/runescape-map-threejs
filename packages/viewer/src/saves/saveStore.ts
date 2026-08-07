@@ -107,6 +107,18 @@ export class SaveStore {
     this.onChange?.();
   }
 
+  /** Flag the store dirty without touching its contents. `load()`
+   *  deliberately leaves the store clean (autoload / Open both depend on
+   *  that — a freshly opened save shouldn't look like an unsaved edit), so
+   *  a caller that loads content the *store itself* hasn't persisted yet —
+   *  today, only the map menu's Import path, since an imported file's
+   *  content lives only in memory until the user explicitly saves it —
+   *  calls this right after `load()` to make that distinction visible. */
+  markDirty(): void {
+    this.dirty = true;
+    this.onChange?.();
+  }
+
   stats(): { regions: number; placements: number; removes: number } {
     let placements = 0;
     let removes = 0;

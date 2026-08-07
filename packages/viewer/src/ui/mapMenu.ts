@@ -26,6 +26,11 @@ export class MapMenu {
   private readonly button = document.createElement("button");
   private readonly dropdown = document.createElement("div");
   private available = false;
+  /** Guards `toggle()`'s async dropdown build (it awaits `client.list()`
+   *  before it can render). Without this, two clicks landing inside that
+   *  await window each rebuild and append their own "open" section,
+   *  leaving every save listed twice. */
+  private opening = false;
   /** `SaveStore.load()` deliberately doesn't round-trip `createdAt` — the
    *  menu holds it externally across save/load/save-as so a re-save keeps
    *  the original creation timestamp instead of stamping "now" every time. */
@@ -67,39 +72,48 @@ export class MapMenu {
       this.dropdown.style.display = "none";
       return;
     }
-    this.dropdown.replaceChildren();
-    const add = (label: string, onClick: () => void | Promise<void>): void => {
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "map-item";
-      item.textContent = label;
-      item.addEventListener("click", () => {
-        this.dropdown.style.display = "none";
-        void onClick();
-      });
-      this.dropdown.appendChild(item);
-    };
+    // A second click landing here while the first is still awaiting
+    // `client.list()` below must not start a second build — see the
+    // `opening` field's doc comment.
+    if (this.opening) return;
+    this.opening = true;
+    try {
+      this.dropdown.replaceChildren();
+      const add = (label: string, onClick: () => void | Promise<void>): void => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "map-item";
+        item.textContent = label;
+        item.addEventListener("click", () => {
+          this.dropdown.style.display = "none";
+          void onClick();
+        });
+        this.dropdown.appendChild(item);
+      };
 
-    add("New map", () => this.newMap());
-    add("Save", () => this.save());
-    add("Save as…", () => this.saveAs());
-    add("Export", () => this.exportFile());
-    add("Import", () => this.importFile());
-    if (this.opts.store.getIdentity().slug) add("Delete", () => this.deleteActive());
+      add("New map", () => this.newMap());
+      add("Save", () => this.save());
+      add("Save as…", () => this.saveAs());
+      add("Export", () => this.exportFile());
+      add("Import", () => this.importFile());
+      if (this.opts.store.getIdentity().slug) add("Delete", () => this.deleteActive());
 
-    const saves = await this.opts.client.list().catch(() => []);
-    if (saves.length > 0) {
-      const sep = document.createElement("div");
-      sep.className = "map-sep";
-      sep.textContent = "open";
-      this.dropdown.appendChild(sep);
-      for (const s of saves) {
-        add(`${s.name} (${s.regions.length} region${s.regions.length === 1 ? "" : "s"})`, () =>
-          this.open(s.slug),
-        );
+      const saves = await this.opts.client.list().catch(() => []);
+      if (saves.length > 0) {
+        const sep = document.createElement("div");
+        sep.className = "map-sep";
+        sep.textContent = "open";
+        this.dropdown.appendChild(sep);
+        for (const s of saves) {
+          add(`${s.name} (${s.regions.length} region${s.regions.length === 1 ? "" : "s"})`, () =>
+            this.open(s.slug),
+          );
+        }
       }
+      this.dropdown.style.display = "block";
+    } finally {
+      this.opening = false;
     }
-    this.dropdown.style.display = "block";
   }
 
   private confirmDiscard(): boolean {
@@ -149,21 +163,29 @@ export class MapMenu {
     ) {
       return;
     }
-    this.createdAt = null;
-    await this.writeAs(name, slug);
+    // `fresh: true` tells `writeAs` to stamp a brand-new `createdAt` rather
+    // than reuse `this.createdAt` — but only once the write actually
+    // succeeds. Resetting `this.createdAt` here, before the write, would
+    // lose the *current* save's original timestamp the moment a
+    // still-in-flight or failed "Save as…" left it null: a later plain
+    // "Save" of the same slug would then stamp `createdAt: now` over a
+    // save that still exists on disk with its real, older timestamp.
+    await this.writeAs(name, slug, { fresh: true });
   }
 
-  private async writeAs(name: string, slug: string): Promise<void> {
+  private async writeAs(name: string, slug: string, opts: { fresh?: boolean } = {}): Promise<void> {
     try {
       const bundle = this.opts.store.serialize({
         name,
         slug,
-        createdAt: this.createdAt ?? undefined,
+        createdAt: opts.fresh ? undefined : (this.createdAt ?? undefined),
       });
       await this.opts.client.write(bundle);
-      // Only after a successful write do we adopt the new identity and mark
-      // clean — a failed write must leave the store exactly as dirty as it
-      // was, so nothing is silently lost.
+      // Only after a successful write do we adopt the new identity, the
+      // (possibly fresh) createdAt, and mark clean — a failed write must
+      // leave the store exactly as dirty as it was, so nothing is silently
+      // lost, and `this.createdAt` must keep pointing at whatever save is
+      // still the one on disk.
       this.createdAt = bundle.manifest.createdAt;
       this.opts.store.setIdentity(slug, name);
       this.opts.store.markClean();
@@ -207,6 +229,15 @@ export class MapMenu {
           const parsed = parseSaveBundle(JSON.parse(text) as unknown);
           this.opts.store.clear();
           this.opts.store.load(parsed);
+          // `load()` deliberately leaves the store clean — autoload and
+          // Open both rely on that. An imported file is different: it
+          // hasn't been written anywhere the app knows about (Export's
+          // download isn't tracked, and `rsmap.lastSave`/`localStorage`
+          // still point at whatever was open before), so treat it as an
+          // unsaved edit from the moment it lands — the dirty dot, the
+          // beforeunload prompt, and the next confirmDiscard() must all
+          // reflect that this map is one refresh away from disappearing.
+          this.opts.store.markDirty();
           this.createdAt = parsed.manifest.createdAt;
           await this.opts.reloadRegions();
           this.opts.setStatus(`imported ${parsed.manifest.name} (unsaved)`);
@@ -221,6 +252,12 @@ export class MapMenu {
   private async deleteActive(): Promise<void> {
     const { slug, name } = this.opts.store.getIdentity();
     if (!slug) return;
+    // Two separate things can be lost here: unsaved edits sitting on top
+    // of the on-disk save (confirmDiscard, same gate as New/Open/Import),
+    // and the on-disk save itself (the delete confirm below). Deleting the
+    // file doesn't imply the user meant to throw away in-memory changes
+    // too, so both must be confirmed independently.
+    if (!this.confirmDiscard()) return;
     if (!window.confirm(`Delete save "${name ?? slug}"? This removes it from disk.`)) return;
     try {
       await this.opts.client.remove(slug);
