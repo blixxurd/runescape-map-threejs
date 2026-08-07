@@ -207,6 +207,52 @@ describe("importLegacyEdits", () => {
     expect(result).toEqual({ imported: 0, skipped: 1 });
   });
 
+  it("counts a placement as skipped — never a guessed 1x1 fallback — when the size fetch fails", async () => {
+    const spawnCalls: SpawnAtOptions[] = [];
+    const placer = fakePlacer(async (opts) => {
+      spawnCalls.push(opts);
+      return { id: 1 };
+    });
+    const opts: ImportLegacyOptions = {
+      overlay: {
+        regionId: 12850,
+        removes: [],
+        adds: [
+          {
+            // A bbox type with a true footprint bigger than 1x1: if a
+            // failed fetch silently fell back to sizeX=1, sizeY=1, this
+            // would still spawn — half a tile off from where the 2x1
+            // footprint should have put it — and count as imported.
+            locId: 4421,
+            plane: 0,
+            tileX: 30,
+            tileZ: 20,
+            type: 10,
+            rotation: 1,
+            animationOverride: null,
+            offsetX: 48.73807545606678,
+            offsetZ: 6.92620781125197,
+          },
+        ],
+      },
+      offsetX: 0,
+      offsetZ: 0,
+      objectPlacer: placer,
+      fetchSize: async () => {
+        throw new Error("HTTP 500");
+      },
+      sampleTerrainAt: () => 20,
+      onRemove: () => {},
+    };
+
+    const result = await importLegacyEdits(opts);
+    expect(result).toEqual({ imported: 0, skipped: 1 });
+    // The placer must never have been asked to spawn anything for this
+    // add — a mispositioned-but-still-placed loc is exactly what the
+    // "never silently mispositioned" constraint rules out.
+    expect(spawnCalls).toHaveLength(0);
+  });
+
   it("forwards every legacy remove to onRemove before processing adds", async () => {
     const removed: Array<[number, string]> = [];
     const placer = fakePlacer(async () => ({ id: 1 }));

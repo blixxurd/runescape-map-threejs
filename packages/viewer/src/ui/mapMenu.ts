@@ -1,6 +1,8 @@
 import { parseSaveBundle, slugify } from "@rsmap/shared/save-file";
 import type { SaveClient } from "../saves/saveClient.js";
 import type { SaveStore } from "../saves/saveStore.js";
+// THROWAWAY (see importLegacyEdits.ts) — type-only import for the
+// `importLegacy` hook below; delete alongside the module in Task 10.
 import type { importLegacyEdits } from "../saves/importLegacyEdits.js";
 
 /**
@@ -271,8 +273,12 @@ export class MapMenu {
       const file = input.files?.[0];
       if (!file) return;
       void file.text().then(async (text) => {
-        const { importLegacyEdits } = await import("../saves/importLegacyEdits.js");
         try {
+          // Dynamic-import the throwaway module inside the try — a failed
+          // chunk load (dev-server hiccup) must surface through setStatus
+          // like every other failure mode here, not become an unhandled
+          // rejection.
+          const { importLegacyEdits } = await import("../saves/importLegacyEdits.js");
           const result = await this.opts.importLegacy!(
             JSON.parse(text) as unknown,
             importLegacyEdits,

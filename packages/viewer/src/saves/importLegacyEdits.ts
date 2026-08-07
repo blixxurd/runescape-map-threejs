@@ -62,7 +62,9 @@ export interface ImportLegacyOptions {
   offsetX: number;
   offsetZ: number;
   objectPlacer: Placer;
-  /** Object footprint lookup — `/api/object/:id` returns sizeX/sizeY. */
+  /** Object footprint lookup — `/api/object/:id` returns sizeX/sizeY. A
+   *  rejection is treated as a hard skip for that add (never a guessed
+   *  1x1 fallback) — see the skip path in the main loop below for why. */
   fetchSize: (locId: number) => Promise<{ sizeX: number; sizeY: number }>;
   sampleTerrainAt: (worldX: number, worldZ: number, plane?: number) => number | null;
   onRemove: (regionId: number, placementIdHex: string) => void;
@@ -96,10 +98,20 @@ export async function importLegacyEdits(
   for (const hex of opts.overlay.removes) opts.onRemove(opts.overlay.regionId, hex);
 
   for (const add of opts.overlay.adds) {
-    const { sizeX, sizeY } = await opts.fetchSize(add.locId).catch(() => ({
-      sizeX: 1,
-      sizeY: 1,
-    }));
+    // A failed size fetch must NOT fall back to a guessed 1x1 footprint —
+    // for a bbox-centered type (10/11) with a true footprint bigger than
+    // 1x1, a wrong footprint shifts `bakeBaseX/Z` by up to half a tile and
+    // the placement would still spawn and still count as imported. Skip
+    // instead, same as a terrain-sample miss.
+    const size = await opts.fetchSize(add.locId).catch((err: unknown) => {
+      console.warn(`[legacy] size fetch failed for loc ${add.locId}:`, err);
+      return null;
+    });
+    if (size === null) {
+      skipped++;
+      continue;
+    }
+    const { sizeX, sizeY } = size;
     const { bakeBaseX, bakeBaseZ } = resolveBakeBase(add, sizeX, sizeY);
 
     const worldX = opts.offsetX + bakeBaseX + (add.offsetX ?? 0);
