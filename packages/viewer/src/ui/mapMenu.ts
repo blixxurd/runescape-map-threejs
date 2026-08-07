@@ -1,6 +1,7 @@
 import { parseSaveBundle, slugify } from "@rsmap/shared/save-file";
 import type { SaveClient } from "../saves/saveClient.js";
 import type { SaveStore } from "../saves/saveStore.js";
+import type { importLegacyEdits } from "../saves/importLegacyEdits.js";
 
 /**
  * Head-bar map control: shows the active save's name plus a dirty dot, and
@@ -19,6 +20,12 @@ export interface MapMenuOptions {
   reloadRegions: () => Promise<void>;
   /** Status line for feedback ("saved", "load failed: …"). */
   setStatus: (msg: string) => void;
+  /** THROWAWAY (see importLegacyEdits.ts). Wired only while migrating the
+   *  pre-saves overlay; both this and the module go away afterwards. */
+  importLegacy?: (
+    overlay: unknown,
+    run: typeof importLegacyEdits,
+  ) => Promise<{ imported: number; skipped: number }>;
 }
 
 export class MapMenu {
@@ -96,6 +103,7 @@ export class MapMenu {
       add("Save as…", () => this.saveAs());
       add("Export", () => this.exportFile());
       add("Import", () => this.importFile());
+      if (this.opts.importLegacy) add("Import legacy edits…", () => this.importLegacy());
       if (this.opts.store.getIdentity().slug) add("Delete", () => this.deleteActive());
 
       const saves = await this.opts.client.list().catch(() => []);
@@ -243,6 +251,37 @@ export class MapMenu {
           this.opts.setStatus(`imported ${parsed.manifest.name} (unsaved)`);
         } catch (err) {
           this.opts.setStatus(`import failed: ${(err as Error).message}`);
+        }
+      });
+    });
+    input.click();
+  }
+
+  /** THROWAWAY (see importLegacyEdits.ts). One-shot file-picker path for
+   *  converting `packages/extractor/edits/<id>.json` into live placements
+   *  on the active map — the overlay lives outside `public/`, so it's read
+   *  through a plain file input rather than a dev-server endpoint. */
+  private importLegacy(): void {
+    if (!this.opts.importLegacy) return;
+    if (!this.confirmDiscard()) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.addEventListener("change", () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      void file.text().then(async (text) => {
+        const { importLegacyEdits } = await import("../saves/importLegacyEdits.js");
+        try {
+          const result = await this.opts.importLegacy!(
+            JSON.parse(text) as unknown,
+            importLegacyEdits,
+          );
+          this.opts.setStatus(
+            `legacy import: ${result.imported} placed, ${result.skipped} skipped — save it now`,
+          );
+        } catch (err) {
+          this.opts.setStatus(`legacy import failed: ${(err as Error).message}`);
         }
       });
     });
