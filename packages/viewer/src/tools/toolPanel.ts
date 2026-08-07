@@ -47,10 +47,6 @@ export interface ToolPanelHost {
   onObeyGeometryToggle(obey: boolean): void;
   /** User clicked the screenshot button (or pressed P). */
   onScreenshot(): void;
-  /** User clicked the commit button to bake pending session edits into
-   *  the on-disk overlay + re-extract affected regions. Only enabled
-   *  when the pendingEdits store reports at least one change. */
-  onCommit(): void;
 }
 
 type AnyCatalog = NpcCatalogEntry[] | ObjectCatalogEntry[] | ItemCatalogEntry[] | SpotAnimCatalogEntry[];
@@ -91,23 +87,35 @@ function injectStyles(): void {
     #toolPanel .head button.head-btn.active {
       background: #2d4b2d; color: #e8f5e8; border-color: #4c6b4c;
     }
-    #toolPanel .head button.head-btn.commit {
+    #toolPanel .head button.head-btn.map-btn {
       background: #2a3a4a; color: #aac6e0; border-color: #3a4a60;
     }
-    #toolPanel .head button.head-btn.commit:hover:not(:disabled) {
+    #toolPanel .head button.head-btn.map-btn:hover:not(:disabled) {
       background: #3a5060; color: #e6f0fa; border-color: #5fdcff;
     }
-    #toolPanel .head button.head-btn.commit:disabled {
+    #toolPanel .head button.head-btn.map-btn:disabled {
       opacity: 0.45; cursor: default; color: #5a6478;
-    }
-    #toolPanel .head button.head-btn.commit.busy {
-      background: #3a3a2a; color: #e0d8aa; border-color: #5a5a40;
     }
     #toolPanel .head .collapse {
       background: transparent; border: none; color: #8f9bb5;
       font: inherit; cursor: pointer; padding: 0 4px;
     }
     #toolPanel .head .collapse:hover { color: #e6e8ec; }
+    #toolPanel .map-slot { position: relative; }
+    #toolPanel .map-dropdown {
+      position: absolute; top: 22px; right: 0; z-index: 20;
+      background: #10151f; border: 1px solid #2a334a; border-radius: 4px;
+      min-width: 200px; padding: 4px 0; box-shadow: 0 4px 16px #0008;
+    }
+    #toolPanel .map-dropdown .map-item {
+      display: block; width: 100%; text-align: left; background: transparent;
+      border: none; color: #c8d0e0; font: inherit; padding: 4px 10px; cursor: pointer;
+    }
+    #toolPanel .map-dropdown .map-item:hover { background: #1d2740; color: #e6f0fa; }
+    #toolPanel .map-dropdown .map-sep {
+      color: #5a6478; font-size: 10px; text-transform: uppercase;
+      padding: 6px 10px 2px; border-top: 1px solid #2a334a; margin-top: 4px;
+    }
     #toolPanel .tabs {
       display: flex; border-bottom: 1px solid #2a334a;
     }
@@ -188,7 +196,6 @@ export class ToolPanel {
   private readonly eyedropperBtn: HTMLButtonElement;
   private readonly freePlaceBtn: HTMLButtonElement;
   private readonly obeyGeomBtn: HTMLButtonElement;
-  private readonly commitBtn: HTMLButtonElement;
 
   private activeTab: ModelTab = "npc";
   private readonly tabStates: Record<ModelTab, TabState> = {
@@ -208,9 +215,7 @@ export class ToolPanel {
       <div class="head">
         <span class="title">editor</span>
         <div class="head-actions">
-          <button class="head-btn commit" type="button" title="commit pending edits to bundle" disabled>
-            commit
-          </button>
+          <span class="map-slot"></span>
           <button class="head-btn free-place" type="button" title="free placement — ignore tile snap">
             free
           </button>
@@ -311,10 +316,6 @@ export class ToolPanel {
     this.eyedropperBtn = this.root.querySelector<HTMLButtonElement>(".eyedropper")!;
     this.freePlaceBtn = this.root.querySelector<HTMLButtonElement>(".free-place")!;
     this.obeyGeomBtn = this.root.querySelector<HTMLButtonElement>(".obey-geom")!;
-    this.commitBtn = this.root.querySelector<HTMLButtonElement>(".commit")!;
-    this.commitBtn.addEventListener("click", () => {
-      if (!this.commitBtn.disabled) this.host.onCommit();
-    });
     this.root
       .querySelector<HTMLButtonElement>(".screenshot")!
       .addEventListener("click", () => this.host.onScreenshot());
@@ -380,25 +381,10 @@ export class ToolPanel {
     this.eyedropperBtn.classList.toggle("active", armed);
   }
 
-  /** Host calls this whenever pendingEdits changes — passes the count of
-   *  pending changes (or null while a commit is in flight). The button
-   *  enables on count > 0, shows a "(N)" badge, and goes "busy" while a
-   *  commit POST is running. */
-  setCommitState(opts: { pending: number; busy: boolean }): void {
-    if (opts.busy) {
-      this.commitBtn.disabled = true;
-      this.commitBtn.classList.add("busy");
-      this.commitBtn.textContent = "committing…";
-      return;
-    }
-    this.commitBtn.classList.remove("busy");
-    if (opts.pending === 0) {
-      this.commitBtn.disabled = true;
-      this.commitBtn.textContent = "commit";
-    } else {
-      this.commitBtn.disabled = false;
-      this.commitBtn.textContent = `commit (${opts.pending})`;
-    }
+  /** Element the MapMenu mounts into. Kept as a slot so the panel doesn't
+   *  need to know anything about saves. */
+  getMapSlot(): HTMLElement {
+    return this.root.querySelector<HTMLElement>(".map-slot")!;
   }
 
   /** Host calls this after the eyedropper resolves a pick and arms the

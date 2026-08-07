@@ -20,10 +20,11 @@ import { Eyedropper } from "./tools/eyedropper.js";
 import { Selection } from "./tools/selection.js";
 import { InspectorPanel } from "./tools/inspectorPanel.js";
 import { loadGlobalAtlas } from "./tools/globalAtlas.js";
-import { SaveStore } from "./saves/saveStore.js";
+import { SaveStore, type ApplyResult } from "./saves/saveStore.js";
 import { SaveClient } from "./saves/saveClient.js";
 import { captureScreenshot } from "./util/screenshot.js";
 import { PlacesPanel } from "./ui/placesPanel.js";
+import { MapMenu } from "./ui/mapMenu.js";
 
 // Match OSRS's sRGB-passthrough convention — the original client never did
 // gamma/linear-space conversions. With Three's default color management on,
@@ -637,11 +638,6 @@ async function main(): Promise<void> {
       forEachModelPlacer((p) => p.setSnapToTile(snap));
     },
     onScreenshot: () => takeScreenshot(),
-    // Bake-time commit is being retired in favor of map saves — task 8
-    // wires the map menu UI and removes this button entirely.
-    onCommit: () => {
-      console.warn("[editor] commit is being replaced by map saves (task 8)");
-    },
   });
 
   // Panel renders the animation-picker once an NPC's bake resolves and
@@ -807,14 +803,48 @@ async function main(): Promise<void> {
     }
   });
 
+  // Tracks the in-flight `saveStore.applyToRegion` promise per region, so
+  // `removeRegionFromScene` can wait it out before detaching (see below).
+  const pendingApplies = new Map<number, Promise<ApplyResult>>();
+  /** Kick off `saveStore.applyToRegion(regionId)` and register the promise
+   *  in `pendingApplies`. Every caller that materializes a save into a
+   *  region — the streaming loader's `startLoad` and the one-shot autoload
+   *  near the end of `main()` — must go through this, not
+   *  `saveStore.applyToRegion` directly, so `removeRegionFromScene` always
+   *  knows what (if anything) it needs to wait out before detaching.
+   *  Never rejects: failures are logged and resolve to an all-zero result
+   *  so callers can treat every apply as fire-and-forget. */
+  const applyToRegionTracked = (regionId: number): Promise<ApplyResult> => {
+    const p = saveStore.applyToRegion(regionId).catch((err: unknown) => {
+      console.warn(`[saves] apply to region ${regionId} failed:`, err);
+      return { hidden: 0, spawned: 0, skipped: 0 };
+    });
+    pendingApplies.set(regionId, p);
+    void p.finally(() => {
+      if (pendingApplies.get(regionId) === p) pendingApplies.delete(regionId);
+    });
+    return p;
+  };
+
   // Helper: tear down a region's scene state. Doesn't dispose GPU buffers
   // explicitly; Three.js's GC handles that on next render. Inspector +
   // eyedropper hold stale references to the old groups but their
   // addRegion calls are idempotent (keyed by regionId) so the next setup
   // overwrites them.
-  const removeRegionFromScene = (regionId: number): void => {
+  //
+  // Waits out any `applyToRegion` still spawning saved placements into this
+  // region before detaching. `SaveStore.applyToRegion` guards against two
+  // concurrent applies for the same region by bailing out immediately
+  // (returning all-zero) rather than queueing — see its `applying` Set. If
+  // we detached and re-`startLoad`ed while an old apply was still mid-spawn,
+  // the fresh apply that `startLoad` kicks off would bail against that
+  // stale in-flight one, and the region would come back with none of its
+  // placements or removes re-applied. Awaiting first guarantees at most one
+  // apply chain is ever active per region, so the next one always runs.
+  const removeRegionFromScene = async (regionId: number): Promise<void> => {
     const lr = regions.get(regionId);
     if (!lr) return;
+    await pendingApplies.get(regionId);
     saveStore.detachRegion(regionId);
     scene.remove(lr.terrainGroup);
     scene.remove(lr.locsGroup);
@@ -824,12 +854,12 @@ async function main(): Promise<void> {
   /** Tear down and re-fetch every loaded region. Used by New map / Open —
    *  bundles on disk are vanilla, so this is how hidden baked locs come
    *  back without any un-hide bookkeeping. `removeRegionFromScene` deletes
-   *  from `regions` synchronously, so by the time we call `startLoad` for
-   *  the same id it's a genuine re-fetch, not the early-return no-op it'd
-   *  be if `regions` still held the old entry. */
+   *  from `regions` synchronously (after its await), so by the time we call
+   *  `startLoad` for the same id it's a genuine re-fetch, not the
+   *  early-return no-op it'd be if `regions` still held the old entry. */
   const reloadLoadedRegions = async (): Promise<void> => {
     const ids = [...regions.keys()];
-    for (const id of ids) removeRegionFromScene(id);
+    await Promise.all(ids.map((id) => removeRegionFromScene(id)));
     await Promise.allSettled(ids.map((id) => startLoad(id)));
   };
 
@@ -880,9 +910,12 @@ async function main(): Promise<void> {
         });
         // Re-materialize this region's slice of the active save: hide its
         // tombstoned baked locs, respawn its tracked placements. Fire-and-
-        // forget — the region is already usable, this just layers the
-        // save on top as it resolves.
-        void saveStore.applyToRegion(lr.regionId).then((r) => {
+        // forget as far as the caller here is concerned — the region is
+        // already usable, this just layers the save on top as it resolves
+        // — but `applyToRegionTracked` registers the promise so a later
+        // `removeRegionFromScene` (New map / Open / Import / Delete) can
+        // wait it out before detaching instead of racing it.
+        void applyToRegionTracked(lr.regionId).then((r) => {
           if (r.skipped > 0) {
             setHud(`${r.skipped} saved placement(s) unavailable on this cache build`);
           }
@@ -922,6 +955,33 @@ async function main(): Promise<void> {
     );
   }
   applyPlaneCap();
+
+  const mapMenu = new MapMenu({
+    store: saveStore,
+    client: saveClient,
+    reloadRegions: reloadLoadedRegions,
+    setStatus: (msg) => setHud(msg),
+  });
+  mapMenu.mount(toolPanel.getMapSlot());
+
+  // Autoload: ?save=<slug> wins, then the last save this browser opened.
+  // `?save=none` forces a vanilla map. Runs after the initial region load
+  // above so `regions` already holds the center (+ neighbor) ids to apply
+  // the save onto directly; anything that streams in later picks up the
+  // now-loaded save through `startLoad`'s own `applyToRegionTracked` call.
+  const saveParam = new URLSearchParams(location.search).get("save");
+  const autoSlug =
+    saveParam === "none" ? null : (saveParam ?? localStorage.getItem("rsmap.lastSave"));
+  if (autoSlug && (await saveClient.isAvailable())) {
+    try {
+      const bundle = await saveClient.read(autoSlug);
+      saveStore.load(bundle);
+      await Promise.all([...regions.keys()].map((id) => applyToRegionTracked(id)));
+      setHud(`loaded map ${bundle.manifest.name}`);
+    } catch (err) {
+      console.warn(`[saves] autoload of "${autoSlug}" failed:`, err);
+    }
+  }
 
   const startTime = performance.now();
   let lastTickMs = startTime;
