@@ -8,7 +8,6 @@ import {
   packRegionId,
   unpackRegionId,
 } from "@rsmap/shared";
-import type { EditsOverlayAdd } from "@rsmap/shared";
 import { loadRegion, type LoadPhase, type RegionData } from "./loader.js";
 import { buildTerrainMeshes } from "./terrain/buildTerrainMesh.js";
 import { placeLocs, tickLocAnimations, type LocAnimationState } from "./locs/placeLocs.js";
@@ -21,7 +20,8 @@ import { Eyedropper } from "./tools/eyedropper.js";
 import { Selection } from "./tools/selection.js";
 import { InspectorPanel } from "./tools/inspectorPanel.js";
 import { loadGlobalAtlas } from "./tools/globalAtlas.js";
-import { PendingEdits } from "./tools/pendingEdits.js";
+import { SaveStore } from "./saves/saveStore.js";
+import { SaveClient } from "./saves/saveClient.js";
 import { captureScreenshot } from "./util/screenshot.js";
 import { PlacesPanel } from "./ui/placesPanel.js";
 
@@ -527,11 +527,33 @@ async function main(): Promise<void> {
     spotanim: spotAnimPlacer,
   };
 
+  // Save store — the active map's runtime overlay (tracked placements +
+  // hidden baked locs). Replaces the old bake-time PendingEdits round trip.
+  // `saveClient` talks to the dev-server save endpoints; wired into UI in
+  // task 8. Constructed here (after the placers exist) so `placerFor` can
+  // close over them directly.
+  const saveClient = new SaveClient();
+  const saveStore = new SaveStore({
+    centerRegionX,
+    centerRegionZ,
+    placerFor: (kind) => {
+      switch (kind) {
+        case "npc": return npcPlacer;
+        case "object": return objectPlacer;
+        case "item": return itemPlacer;
+        case "spotanim": return spotAnimPlacer;
+        default: return null;
+      }
+    },
+    getLoadedRegion: (regionId) => {
+      const lr = regions.get(regionId);
+      return lr
+        ? { offsetX: lr.offsetX, offsetZ: lr.offsetZ, locsGroup: lr.locsGroup }
+        : undefined;
+    },
+  });
+
   let toolPanel!: ToolPanel;
-  /** Forward-declared so the toolPanel constructor can wire its commit
-   *  button before the supporting state (pendingEdits, regions, placer
-   *  hooks) exists. Assigned below once everything is in scope. */
-  let commitPendingEdits: () => Promise<void> = async () => {};
   const forEachModelPlacer = (fn: (p: ModelPlacer) => void): void => {
     fn(npcPlacer);
     fn(objectPlacer);
@@ -615,9 +637,11 @@ async function main(): Promise<void> {
       forEachModelPlacer((p) => p.setSnapToTile(snap));
     },
     onScreenshot: () => takeScreenshot(),
-    // commitPendingEdits is forward-declared and assigned below — wrapping
-    // in a closure lets us resolve it lazily when the user clicks.
-    onCommit: () => void commitPendingEdits(),
+    // Bake-time commit is being retired in favor of map saves — task 8
+    // wires the map menu UI and removes this button entirely.
+    onCommit: () => {
+      console.warn("[editor] commit is being replaced by map saves (task 8)");
+    },
   });
 
   // Panel renders the animation-picker once an NPC's bake resolves and
@@ -685,11 +709,6 @@ async function main(): Promise<void> {
   // than the bare `renderer.render(...)`. Construction must come after
   // every placer has registered its click listener so selection's bubble
   // handler runs last and can defer to armed placers.
-  // Pending-edits store — accumulates session edits to baked locs and
-  // session-added objects until the user clicks "commit" on the toolbar.
-  // Shared across selection (which records baked-loc removes) and the
-  // object placer hook below (which records session adds).
-  const pendingEdits = new PendingEdits();
   selection = new Selection({
     scene,
     camera,
@@ -702,7 +721,7 @@ async function main(): Promise<void> {
         locsGroup: r.locsGroup,
         locsManifest: r.region.locs,
       })),
-    pendingEdits,
+    saveStore,
     isAnyToolArmed: () =>
       npcPlacer.isArmed() ||
       objectPlacer.isArmed() ||
@@ -729,340 +748,89 @@ async function main(): Promise<void> {
     p.onMeshRemoved = (mesh) => selection!.notifyMeshRemoved(mesh);
   });
 
-  // ---- Object-placer → pendingEdits bridge ----
+  // ---- Placer → SaveStore bridge ----
   //
-  // Only the Object placer feeds `pendingEdits` for now. NPCs / items /
-  // spotanims are session-only per the v1 spec — their placements vanish
-  // on reload and never round-trip into a baked region.
-  //
-  // Mesh → tracked add reference. We mutate the same EditsOverlayAdd in
-  // place when the mesh's pose changes, so PendingEdits.snapshot() always
-  // reflects the live state without per-update bookkeeping. Cleared on
-  // remove + on commit (handled in the commit handler below).
-  const pendingObjectAdds = new Map<
-    THREE.Mesh,
-    {
-      regionId: number;
-      add: EditsOverlayAdd;
-      /** ObjectDefinition.sizeX/sizeY (1..N tile footprint) — needed by
-       *  `subOffsetForTile` to cancel `placeLocs`' bbox-center shift for
-       *  multi-tile type 10/11 locs. Both default to 1 and the offset
-       *  math reduces to plain tile-center for 1×1. */
-      sizeX: number;
-      sizeY: number;
-      /** OSRS plane the placement was committed to. Mirrors `add.plane`
-       *  for the lifetime of the tracked add — kept here so onPlacementUpdated
-       *  can pass the right plane to `subOffsetForTile`'s terrain sample. */
-      plane: number;
-    }
-  >();
-
-  /** World (x, z) → (regionId, region-local tileX, tileZ). Returns null
-   *  when the position falls outside the addressable cache grid. Mirrors
-   *  `sampleTerrainAt`'s region-resolution math; tile-local coords use
-   *  cache convention (cache +Y = north, so tileZ = floor(-localZ /
-   *  TILE_SIZE)). */
-  const worldToTile = (
-    worldX: number,
-    worldZ: number,
-  ): { regionId: number; tileX: number; tileZ: number } | null => {
-    const dRx = Math.floor(worldX / REGION_SPAN);
-    const dRz = Math.floor(-worldZ / REGION_SPAN);
-    const rx = centerRegionX + dRx;
-    const rz = centerRegionZ + dRz;
-    if (rx < 0 || rx > 0xff || rz < 0 || rz > 0xff) return null;
-    const localX = worldX - dRx * REGION_SPAN;
-    const localZ = -worldZ - dRz * REGION_SPAN;
-    const tileX = Math.floor(localX / TILE_SIZE);
-    const tileZ = Math.floor(localZ / TILE_SIZE);
-    if (tileX < 0 || tileX > 63 || tileZ < 0 || tileZ > 63) return null;
-    return { regionId: packRegionId(rx, rz), tileX, tileZ };
+  // Every placer feeds the active save now (NPCs / items / spotanims
+  // included — the old "objects only" restriction was a PendingEdits/
+  // bake-time limitation that doesn't apply to the runtime overlay).
+  // `spawnAt` (used by `SaveStore.applyToRegion` to re-materialize a
+  // loaded save) passes `notify: false`, so these hooks only fire for
+  // actual new placements the user makes — not for save playback.
+  npcPlacer.onPlacementSpawned = (mesh, id, _name, _t, _sx, _sy, plane) => {
+    saveStore.trackSpawn(mesh, { kind: "npc", id, plane });
   };
-
-  /** Decompose a free-form Y rotation (radians) into the nearest cache
-   *  cardinal (0..3, used for the bundle's `rotation` field + the
-   *  bakedRotation block lookup) plus a residual angle (radians, signed;
-   *  approximately (−π/4, π/4]) applied per-instance.
-   *
-   *  IMPORTANT: cache rotations go the OPPOSITE way around +Y than
-   *  Three.js. The extractor's `rotateModelVertices` for cache rotation 1
-   *  produces the same world-space vertex layout as `Matrix4.makeRotationY(−π/2)`.
-   *  Walked through:
-   *    cache R1 in cache coords: `(xc, yc, zc) → (zc, yc, −xc)`.
-   *    Y/Z flip in `flattenModel`: world ← `(xc, −yc, −zc)`.
-   *    Composed: world `(xw, yw, zw) → (−zw, yw, xw)` ≡ `Matrix4.makeRotationY(−π/2)`.
-   *  So cardinal R corresponds to world rotation `−R × π/2`. To match a
-   *  user-intended world rotation θ, pick cardinal = `(4 − round(θ / (π/2))) mod 4`
-   *  and residual = `θ + cardinal × π/2` (then normalise to (−π, π]).
-   *
-   *  Without this inversion, 90° and 270° placements baked at the *mirror*
-   *  edge (works at 0°/180° because they're their own mirrors). */
-  const decomposeRotation = (
-    rotationY: number,
-  ): { cardinal: number; residual: number } => {
-    let norm = rotationY % (Math.PI * 2);
-    if (norm < 0) norm += Math.PI * 2;
-    const quarters = Math.round(norm / (Math.PI / 2));
-    const cardinal = ((4 - quarters) % 4 + 4) % 4;
-    let residual = norm + cardinal * (Math.PI / 2);
-    // Normalise to (−π, π] so the residual is the smallest equivalent angle.
-    residual = residual % (Math.PI * 2);
-    if (residual > Math.PI) residual -= Math.PI * 2;
-    if (residual <= -Math.PI) residual += Math.PI * 2;
-    return { cardinal, residual };
-  };
-
-  /** Sub-tile noise threshold (world units). Anything below this lives
-   *  inside the integer-tile snap and gets dropped from the wire payload
-   *  to keep overlays clean. ~0.4% of a tile. */
-  const SUB_OFFSET_EPSILON = 0.5;
-
-  /** Sub-tile world-space offset from a mesh position to the world-space
-   *  position the extractor's `placeLocs` will produce after re-bake.
-   *  For 1×1 locs (sizeX=sizeY=1) and non-bbox-centered types (walls 0..3,
-   *  wall decor 4..8, floor decor 22), that's just the tile center. For
-   *  multi-tile type 10/11 placements `placeLocs` shifts the world position
-   *  to the bbox CENTER (`tileX*128 + sizeX*64`), so `offsetX` here has to
-   *  cancel the half-cell extras: a 2×1 loc clicked at tile (a, b) wants
-   *  to render at world `(a*128 + 64, _, -(b*128 + 64))`, but bake produces
-   *  `(a*128 + 128, _, -(b*128 + 64))` — recording `offsetX = -64`
-   *  brings them back into agreement.
-   *
-   *  Bbox-rotated case: `placeLocs` swaps sizeX/sizeY when origRotation is
-   *  1 or 3, so we must use the SAME swap here, keyed off the cardinal we
-   *  just decomposed. Otherwise a rotated 2×1 loc commits with the wrong
-   *  axis offset (the "Z is off after commit" bug from the in-session
-   *  test). World axes: +X east, +Z south.  */
-  const subOffsetForTile = (
-    mesh: THREE.Mesh,
-    tileX: number,
-    tileZ: number,
-    type: number,
-    cardinal: number,
-    sizeX: number,
-    sizeY: number,
-    plane: number,
-  ): { offsetX?: number; offsetZ?: number; offsetY?: number } => {
-    const isBoundingBoxed = type === 10 || type === 11;
-    let effSX = sizeX;
-    let effSY = sizeY;
-    if (isBoundingBoxed && (cardinal === 1 || cardinal === 3)) {
-      effSX = sizeY;
-      effSY = sizeX;
-    }
-    const offsetCellsX = isBoundingBoxed ? effSX : 1;
-    const offsetCellsY = isBoundingBoxed ? effSY : 1;
-    const bakeBaseX = tileX * TILE_SIZE + (offsetCellsX * TILE_SIZE) / 2;
-    const bakeBaseZ = -(tileZ * TILE_SIZE + (offsetCellsY * TILE_SIZE) / 2);
-    const offsetX = mesh.position.x - bakeBaseX;
-    const offsetZ = mesh.position.z - bakeBaseZ;
-    // Y offset = how far the mesh sits above the terrain Y at its tile.
-    // Zero for plain ground placements (mesh.y was clamped to terrain by
-    // the placer). Non-zero when obey-geometry stacked the placement on
-    // another loc — `placeLocs` re-applies this on top of the terrain
-    // sample so the stack survives re-bake. Sample at the bake-base XZ
-    // (not mesh.position.xz) so the reference matches `placeLocs`'
-    // sampling site exactly.
-    const terrainY = sampleTerrainAt(bakeBaseX, bakeBaseZ, plane);
-    const offsetY = terrainY !== null ? mesh.position.y - terrainY : 0;
-    return {
-      ...(Math.abs(offsetX) >= SUB_OFFSET_EPSILON ? { offsetX } : {}),
-      ...(Math.abs(offsetZ) >= SUB_OFFSET_EPSILON ? { offsetZ } : {}),
-      ...(Math.abs(offsetY) >= SUB_OFFSET_EPSILON ? { offsetY } : {}),
-    };
-  };
-
-  objectPlacer.onPlacementSpawned = (mesh, id, _name, modelType, sizeX, sizeY, plane) => {
-    const tile = worldToTile(mesh.position.x, mesh.position.z);
-    if (!tile) {
-      console.warn(`[commit] object spawn at (${mesh.position.x}, ${mesh.position.z}) outside loaded grid; not tracking`);
-      return;
-    }
-    // Use the placement type the extractor's bakeObject chose for this
-    // loc (its first declared `objectTypes[]`). Walls (0..3), wall decor
-    // (4..8), and floor decor (22) all need their native type — hardcoded
-    // 10 made fences (type 0) silently vanish on re-bake.
-    const { cardinal, residual } = decomposeRotation(mesh.rotation.y);
-    const type = modelType ?? 10;
-    const sX = sizeX ?? 1;
-    const sY = sizeY ?? 1;
-    const add: EditsOverlayAdd = {
-      locId: id,
+  objectPlacer.onPlacementSpawned = (mesh, id, _name, modelType, _sizeX, _sizeY, plane) => {
+    saveStore.trackSpawn(mesh, {
+      kind: "object",
+      id,
       plane,
-      tileX: tile.tileX,
-      tileZ: tile.tileZ,
-      type,
-      rotation: cardinal,
-      animationOverride: null,
-      ...subOffsetForTile(mesh, tile.tileX, tile.tileZ, type, cardinal, sX, sY, plane),
-      ...(Math.abs(residual) > 1e-4 ? { rotationY: residual } : {}),
-    };
-    pendingEdits.addAdd(tile.regionId, add);
-    pendingObjectAdds.set(mesh, {
-      regionId: tile.regionId,
-      add,
-      sizeX: sX,
-      sizeY: sY,
-      plane,
+      type: modelType ?? 10,
     });
   };
-
-  objectPlacer.onPlacementUpdated = (mesh) => {
-    const tracked = pendingObjectAdds.get(mesh);
-    if (!tracked) return;
-    const tile = worldToTile(mesh.position.x, mesh.position.z);
-    if (!tile) return;
-    if (tile.regionId !== tracked.regionId) {
-      // Crossed a region boundary — re-key under the new region. The
-      // previous region's pendingEdits entry must drop the old add.
-      pendingEdits.deleteAdd(tracked.regionId, tracked.add);
-      tracked.regionId = tile.regionId;
-      pendingEdits.addAdd(tile.regionId, tracked.add);
-    }
-    tracked.add.tileX = tile.tileX;
-    tracked.add.tileZ = tile.tileZ;
-    const { cardinal, residual } = decomposeRotation(mesh.rotation.y);
-    tracked.add.rotation = cardinal;
-    if (Math.abs(residual) > 1e-4) tracked.add.rotationY = residual;
-    else delete tracked.add.rotationY;
-    // Recompute sub-tile offset on every drag so the committed value
-    // tracks the latest cursor position. Below-epsilon offsets get
-    // dropped to keep overlays clean.
-    const sub = subOffsetForTile(
-      mesh,
-      tile.tileX,
-      tile.tileZ,
-      tracked.add.type,
-      cardinal,
-      tracked.sizeX,
-      tracked.sizeY,
-      tracked.plane,
-    );
-    if (sub.offsetX !== undefined) tracked.add.offsetX = sub.offsetX;
-    else delete tracked.add.offsetX;
-    if (sub.offsetZ !== undefined) tracked.add.offsetZ = sub.offsetZ;
-    else delete tracked.add.offsetZ;
-    if (sub.offsetY !== undefined) tracked.add.offsetY = sub.offsetY;
-    else delete tracked.add.offsetY;
-    pendingEdits.notifyChange();
+  itemPlacer.onPlacementSpawned = (mesh, id, _name, _t, _sx, _sy, plane) => {
+    saveStore.trackSpawn(mesh, { kind: "item", id, plane });
   };
-
-  objectPlacer.onMeshRemoved = (mesh) => {
-    selection!.notifyMeshRemoved(mesh);
-    const tracked = pendingObjectAdds.get(mesh);
-    if (!tracked) return;
-    pendingEdits.deleteAdd(tracked.regionId, tracked.add);
-    pendingObjectAdds.delete(mesh);
+  spotAnimPlacer.onPlacementSpawned = (mesh, id, _name, _t, _sx, _sy, plane) => {
+    saveStore.trackSpawn(mesh, { kind: "spotanim", id, plane });
   };
+  for (const p of [npcPlacer, objectPlacer, itemPlacer, spotAnimPlacer]) {
+    p.onPlacementUpdated = (mesh) => saveStore.updateFromMesh(mesh);
+    // Chain onto the notifyMeshRemoved handler set just above — both need
+    // to run: selection drops a stale outline, saveStore forgets the
+    // placement.
+    const prevRemoved = p.onMeshRemoved;
+    p.onMeshRemoved = (mesh) => {
+      saveStore.untrack(mesh);
+      prevRemoved?.(mesh);
+    };
+  }
 
-  // Drive the toolbar's commit button from pendingEdits state. Called now
-  // and on every onChange tick.
-  let commitInFlight = false;
-  const refreshCommitButton = (): void => {
-    toolPanel.setCommitState({
-      pending: pendingEdits.count(),
-      busy: commitInFlight,
-    });
-  };
-  pendingEdits.onChange = refreshCommitButton;
-  refreshCommitButton();
+  // NPC animation-override swap is driven by the inspector panel calling
+  // `placer.swapAnimation` directly (there's no dedicated hook for it).
+  // Wrap the instance method so a successful swap also lands in the save —
+  // otherwise an NPC's animation override would silently not round-trip.
+  const originalSwapAnimation = npcPlacer.swapAnimation?.bind(npcPlacer);
+  if (originalSwapAnimation) {
+    npcPlacer.swapAnimation = async (mesh, animationId) => {
+      await originalSwapAnimation(mesh, animationId);
+      saveStore.setAnimationOverride(mesh, animationId);
+    };
+  }
 
-  // Warn the user if they try to close/reload the tab with un-committed
-  // edits. Browsers ignore the custom message and show their own confirm
-  // — the API still requires preventDefault() + returnValue assignment.
+  // Warn the user if they try to close/reload the tab with an unsaved map.
+  // Browsers ignore the custom message and show their own confirm — the
+  // API still requires preventDefault() + returnValue assignment.
   window.addEventListener("beforeunload", (e) => {
-    if (pendingEdits.isPending() || commitInFlight) {
+    if (saveStore.isDirty()) {
       e.preventDefault();
       e.returnValue = "";
     }
   });
 
-  // Helper: tear down a region's scene state so startLoad can re-fetch it
-  // from a freshly re-baked bundle. Doesn't dispose GPU buffers explicitly;
-  // Three.js's GC handles that on next render. Inspector + eyedropper
-  // hold stale references to the old groups but their addRegion calls are
-  // idempotent (keyed by regionId) so the next setup overwrites them.
+  // Helper: tear down a region's scene state. Doesn't dispose GPU buffers
+  // explicitly; Three.js's GC handles that on next render. Inspector +
+  // eyedropper hold stale references to the old groups but their
+  // addRegion calls are idempotent (keyed by regionId) so the next setup
+  // overwrites them.
   const removeRegionFromScene = (regionId: number): void => {
     const lr = regions.get(regionId);
     if (!lr) return;
+    saveStore.detachRegion(regionId);
     scene.remove(lr.terrainGroup);
     scene.remove(lr.locsGroup);
     regions.delete(regionId);
   };
 
-  /**
-   * POST every pending diff to /api/dev/commit-edits, then reload each
-   * affected region from the freshly re-baked bundle. Order:
-   *   1. Snapshot pendingEdits (frozen reference set).
-   *   2. POST each region's diff.
-   *   3. On success per region:
-   *      a. Remove session meshes for committed adds (so they don't
-   *         duplicate the now-baked InstancedMesh slot).
-   *      b. Drop only the snapshot's entries from pendingEdits — any
-   *         brand-new edits made during the in-flight POST stay.
-   *      c. Tear down the region's scene state and re-trigger startLoad.
-   *   4. On failure per region: leave pending edits alone, surface error.
-   */
-  commitPendingEdits = async (): Promise<void> => {
-    if (commitInFlight) return;
-    if (!pendingEdits.isPending()) return;
-    const snapshot = pendingEdits.snapshot();
-    commitInFlight = true;
-    refreshCommitButton();
-    let failures = 0;
-    setHud(`committing ${snapshot.size} region(s)…`);
-    try {
-      for (const [regionId, diff] of snapshot) {
-        try {
-          // The dev endpoint serialises save+extract behind a per-region
-          // mutex, so we just await the response. JSON.stringify(diff)
-          // freezes the wire payload — even if pendingEdits' add objects
-          // mutate later, the server sees the values at this moment.
-          const r = await fetch(
-            `/api/dev/commit-edits?region=${regionId}`,
-            {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify(diff),
-            },
-          );
-          if (!r.ok) {
-            const body = (await r.json().catch(() => ({}))) as { error?: string };
-            throw new Error(`HTTP ${r.status}: ${body.error ?? "unknown"}`);
-          }
-
-          // Pre-clean: remove session meshes for adds we just committed so
-          // they don't double up against the new InstancedMesh.
-          for (const [mesh, info] of [...pendingObjectAdds]) {
-            if (info.regionId === regionId && diff.adds.includes(info.add)) {
-              objectPlacer.removeMesh(mesh);
-            }
-          }
-          // Drop only this snapshot's entries (preserving any new edits
-          // the user made during the in-flight POST).
-          for (const hex of diff.removes) pendingEdits.removeRemove(regionId, hex);
-          for (const add of diff.adds) pendingEdits.deleteAdd(regionId, add);
-
-          // Reload the region from disk — the bundle now reflects the
-          // committed overlay.
-          removeRegionFromScene(regionId);
-          await startLoad(regionId);
-        } catch (err) {
-          console.error(`[commit] region ${regionId} failed:`, err);
-          failures++;
-        }
-      }
-    } finally {
-      commitInFlight = false;
-      refreshCommitButton();
-      setHud(
-        failures > 0
-          ? `commit done (${failures} failed — see console)`
-          : `commit done`,
-      );
-      // Restore the normal HUD on the next streamCheck tick.
-      updateHud();
-    }
+  /** Tear down and re-fetch every loaded region. Used by New map / Open —
+   *  bundles on disk are vanilla, so this is how hidden baked locs come
+   *  back without any un-hide bookkeeping. `removeRegionFromScene` deletes
+   *  from `regions` synchronously, so by the time we call `startLoad` for
+   *  the same id it's a genuine re-fetch, not the early-return no-op it'd
+   *  be if `regions` still held the old entry. */
+  const reloadLoadedRegions = async (): Promise<void> => {
+    const ids = [...regions.keys()];
+    for (const id of ids) removeRegionFromScene(id);
+    await Promise.allSettled(ids.map((id) => startLoad(id)));
   };
 
   // Inspector panel — listens to selection events and pushes property
@@ -1109,6 +877,15 @@ async function main(): Promise<void> {
           locsManifest: lr.region.locs,
           terrainGroup: lr.terrainGroup,
           locsGroup: lr.locsGroup,
+        });
+        // Re-materialize this region's slice of the active save: hide its
+        // tombstoned baked locs, respawn its tracked placements. Fire-and-
+        // forget — the region is already usable, this just layers the
+        // save on top as it resolves.
+        void saveStore.applyToRegion(lr.regionId).then((r) => {
+          if (r.skipped > 0) {
+            setHud(`${r.skipped} saved placement(s) unavailable on this cache build`);
+          }
         });
         if (BUILD_ID === undefined) BUILD_ID = lr.region.terrainMeta.buildId;
         return lr;

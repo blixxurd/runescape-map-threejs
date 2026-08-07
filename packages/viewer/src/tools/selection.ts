@@ -7,7 +7,7 @@ import type { LocsManifest } from "@rsmap/shared";
 import { TILE_SIZE } from "@rsmap/shared";
 import type { Placer, PlacedRef } from "./placerTypes.js";
 import { resolveLocHit, type LocHit } from "./locResolve.js";
-import type { PendingEdits } from "./pendingEdits.js";
+import type { SaveStore } from "../saves/saveStore.js";
 import { SUNK_Y, hideInstancedSlot, hideMergedTriangles } from "../locs/hideLoc.js";
 
 /**
@@ -20,7 +20,7 @@ import { SUNK_Y, hideInstancedSlot, hideMergedTriangles } from "../locs/hideLoc.
  *   - `kind: "placed"` — full editor support: gizmo, numeric pose inputs,
  *     duplicate, animation override, arrow-key nudge.
  *   - `kind: "baked"` — read-only inspector + Delete (records a tombstone
- *     in `PendingEdits` and zero-scales the InstancedMesh slot or zero-
+ *     in `SaveStore` and zero-scales the InstancedMesh slot or zero-
  *     vertexes the merged-mesh triangles for instant feedback). Does not
  *     attach the TransformControls — moving baked locs is out of scope
  *     for v1; users delete + re-place via the Object placer instead.
@@ -62,8 +62,8 @@ export interface SelectionHost {
   /** Loaded regions to also raycast against (for baked-loc clicks). Same
    *  per-call pattern — fresh stream-loaded regions show up automatically. */
   getRegions: () => SelectionRegion[];
-  /** Pending-edits store. Baked-loc Delete records a tombstone here. */
-  pendingEdits: PendingEdits;
+  /** Active map save. Baked-loc Delete records a tombstone here. */
+  saveStore: SaveStore;
   /** Returns true if some other tool (placer / eyedropper) is currently
    *  armed. Selection bails on click when true so it doesn't fight with
    *  placement clicks. */
@@ -263,7 +263,7 @@ export class Selection {
   }
 
   /** Delete the current selection through the kind-appropriate path:
-   *  placed → placer.removeMesh, baked → tombstone in pendingEdits +
+   *  placed → placer.removeMesh, baked → tombstone in the save store +
    *  hide the slot/triangles. Used by the inspector panel's Delete
    *  button so the same button works for both selection kinds. */
   deleteSelection(): void {
@@ -434,9 +434,10 @@ export class Selection {
   }
 
   /**
-   * Record the baked selection as a "remove" in `pendingEdits` and hide it
-   * from the scene immediately so the user sees the deletion before the
-   * eventual re-bake. Visual feedback differs by mesh kind:
+   * Record the baked selection as a "remove" in the save store and hide it
+   * from the scene immediately — the hide is permanent for the session
+   * (and for any future load of this save) since nothing re-bakes the
+   * bundle. Visual feedback differs by mesh kind:
    *   - InstancedMesh: zero-scale + sink the matrix at this slot. Cheap;
    *     the slot stays allocated and re-render produces no fragments.
    *   - merged Mesh: zero out the affected triangles' vertex positions in
@@ -455,7 +456,7 @@ export class Selection {
       );
       return;
     }
-    this.host.pendingEdits.addRemove(regionId, locHit.placementIdHex);
+    this.host.saveStore.addRemove(regionId, locHit.placementIdHex);
     // The outline ghost has already hidden the source instance/triangles
     // for visual feedback (see selectBaked). For Delete we keep that hide
     // in place — drop the ghost without restoring.
