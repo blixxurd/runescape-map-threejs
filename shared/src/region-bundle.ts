@@ -337,19 +337,21 @@ export interface LocPlacement {
   blockedEdges: number;
   /**
    * Sub-tile world-unit offset added to the placement's translation when
-   * rendering. Carries free-place precision from the in-viewer commit-edits
-   * editor (cache placements never set these). All three fields default
-   * to 0 and are elided from the JSON when zero.
+   * rendering. Bundles are always vanilla cache output — the extractor
+   * never sets these (cache placements sit exactly on tile centers) — but
+   * `placeLocs.ts` still reads them defensively, and the fields stay part
+   * of the schema so a future non-cache placement source (or an older
+   * hand-authored bundle) has somewhere to put sub-tile precision without
+   * a schema bump. All three fields default to 0 and are elided from the
+   * JSON when zero.
    *
    * Sign convention: world space — `offsetX` adds to `wx` (east+),
-   * `offsetZ` adds to `wz` (south+), `offsetY` adds to `wy` (up+). Editor
-   * side: `(offsetX, offsetZ) = mesh.position.xz - bbox-base.xz`,
-   * `offsetY = mesh.position.y - sampleTerrainAt(mesh.x, mesh.z)`.
+   * `offsetZ` adds to `wz` (south+), `offsetY` adds to `wy` (up+).
    *
-   * `offsetY` is what makes "obey geometry" stacks (cat on a box on a
-   * table) survive a re-bake — without it, `placeLocs` plants every
-   * placement on the terrain Y for its tile and stacks collapse to the
-   * floor on commit.
+   * The in-viewer editor's own placements (NPCs, objects, items, FX) don't
+   * flow through this field at all — they're runtime-only, tracked and
+   * positioned directly by the save system (`packages/viewer/src/saves/`),
+   * never baked into a bundle.
    */
   offsetX?: number;
   offsetZ?: number;
@@ -357,12 +359,13 @@ export interface LocPlacement {
   /**
    * Residual Y-axis rotation (radians) applied per-instance ON TOP of
    * the cardinal `bakedRotation` already pre-applied to the block's
-   * vertices. Lets the editor commit non-cardinal angles (45°, 22.5°,
-   * etc.) without needing a separate model bake per fine angle.
+   * vertices. Lets a placement source that isn't a raw cache record
+   * specify a non-cardinal angle (45°, 22.5°, etc.) without needing a
+   * separate model bake per fine angle.
    *
    * Cache placements never set this (rotation is always cardinal in the
-   * cache). Adds with non-zero residuals from the in-viewer free-rotation
-   * editor record it here. Default 0; omitted from the JSON when 0.
+   * cache), and the extractor doesn't produce any other kind of placement
+   * today — bundles are vanilla. Default 0; omitted from the JSON when 0.
    *
    * Sign convention: Three.js right-hand rule around world +Y. Positive
    * rotates +Z toward +X. Decomposition:
@@ -393,13 +396,14 @@ export interface LocsManifest {
    * Per-placement stable ID, parallel to `placements` by index. Layout:
    * Uint32 × placements.length. Hash of
    * `(plane, localX, localZ, locId, origType, origRotation)`, computed by
-   * `placementHash` in `packages/extractor/src/region/edits.ts`. Used by
-   * the in-viewer "commit edits" feature: a raycast hit → instanceId or
-   * faceIndex → placement index → placement ID, which the viewer sends to
-   * `/api/dev/commit-edits` as a "remove" tombstone. WALL_CORNER (type 2)
-   * expands to two LocPlacements sharing one cache record; both rows get
-   * the same ID, so one tombstone removes both halves cleanly. Empty
-   * regions get `placementIdsByteLength: 0` and skip the file.
+   * `placementHash` in `packages/extractor/src/region/placementHash.ts`.
+   * Used by the viewer's runtime save system: a raycast hit → instanceId or
+   * faceIndex → placement index → placement ID, which gets recorded as a
+   * "remove" in the active save so the baked loc stays hidden across a
+   * region reload or re-extract. WALL_CORNER (type 2) expands to two
+   * LocPlacements sharing one cache record; both rows get the same ID, so
+   * one remove hides both halves cleanly. Empty regions get
+   * `placementIdsByteLength: 0` and skip the file.
    */
   placementIdsFile: string; // "locs.placementIds.bin"
   placementIdsByteLength: number;
@@ -474,67 +478,4 @@ export interface LocsDebug {
   schemaVersion: typeof LOCS_DEBUG_SCHEMA;
   /** Parallel to `LocsManifest.blocks` by index. */
   blocks: LocDebugBlock[];
-}
-
-// ---------- Edits overlay ----------
-
-/**
- * On-disk overlay applied to a region during extraction so user edits made
- * in the viewer survive a re-extract. Lives at
- * `packages/extractor/edits/<regionId>.json` (checked into git — source
- * data, NOT under `regions/` which is gitignored).
- *
- * Two operations:
- *   - **removes**: hex placement IDs (8 chars; uint32 zero-padded). The
- *     extractor filters out any cache-record placement whose hash matches.
- *   - **adds**: synthesised placements appended to the region. Adds with
- *     unknown `locId` are rejected at the API boundary (commit-edits
- *     endpoint validates against the object catalog).
- *
- * "Move a placement" is modelled as remove + add — the placement ID changes
- * because the hash inputs change. Out of scope for v1: moving baked locs at
- * all. v1 supports add-fresh + delete-baked only.
- */
-export const EDITS_SCHEMA = 1 as const;
-
-export interface EditsOverlay {
-  schemaVersion: typeof EDITS_SCHEMA;
-  regionId: number;
-  removes: string[];
-  adds: EditsOverlayAdd[];
-}
-
-export interface EditsOverlayAdd {
-  locId: number;
-  plane: number;
-  /** Region-local tile coords (0..63). */
-  tileX: number;
-  tileZ: number;
-  /** OSRS placement type 0..22. The viewer emits whatever type the source
-   *  bake chose (walls 0..3, wall decor 4..8, normal scenery 10, floor
-   *  decor 22). Hardcoding 10 used to silently drop fences/doors at
-   *  re-bake time. */
-  type: number;
-  /** Cardinal cache rotation 0..3 (from `decomposeRotation` in the viewer).
-   *  Non-cardinal placement angles ride along in `rotationY` below — the
-   *  pair round-trips losslessly. */
-  rotation: number;
-  /** Per-placement animation override. v1 ignores this on the extract
-   *  side; reserved for future per-instance animation overrides. */
-  animationOverride: number | null;
-  /** Sub-tile offsets in world units. `offsetX/offsetZ` carry free-place
-   *  precision (relative to the bake's bbox-base position; see
-   *  `LocPlacement` for sign convention). `offsetY` carries obey-geometry
-   *  stack height — added on top of `placeLocs`' terrain-Y sample so a
-   *  placement that the user dropped on a box stays on the box after
-   *  re-bake. All three default to 0 and may be omitted. */
-  offsetX?: number;
-  offsetZ?: number;
-  offsetY?: number;
-  /** Residual Y-axis rotation (radians) applied on top of the cardinal
-   *  `rotation`. Lets the editor preserve non-cardinal placement angles
-   *  (45°, 22.5°, etc.) — the cache schema only stores cardinal rotations,
-   *  so anything in between would otherwise snap on commit. Default 0,
-   *  omitted when 0. See `LocPlacement.rotationY` for the sign convention. */
-  rotationY?: number;
 }

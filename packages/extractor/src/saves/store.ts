@@ -9,9 +9,10 @@ import {
 } from "@rsmap/shared/save-file";
 
 // Resolve the repo root from this file's location rather than importing
-// REPO_ROOT from `../index.js`. `region/edits.ts` does the same thing for
-// the same reason: index imports region/locs.js, so pulling REPO_ROOT
-// through that path risks a circular import.
+// REPO_ROOT from `../index.js` — `index.ts` re-exports this module's
+// functions (`listSaves`/`readSave`/`writeSave`/`deleteSave`), so importing
+// REPO_ROOT back from there would set up a cycle for no benefit over just
+// resolving it locally.
 const REPO_ROOT = resolve(import.meta.dirname, "../../../..");
 
 /**

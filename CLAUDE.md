@@ -194,38 +194,40 @@ full loop so the editor can show the animation continuously. See
 
 Selection layer (no tool armed → click-to-select). Two flavours: existing
 *placed* entities get the full editor; *baked* scenery locs from the cache
-get a read-only inspector + Delete (which records a tombstone for the next
-commit).
+get a read-only inspector + Delete (which records the loc as a "remove" in
+the active save, hiding it immediately).
 
 - `OutlinePass` highlights the selected mesh in cyan. Baked-loc selections
   use a single-instance "outline ghost" so the cyan edge is on just the
   clicked instance, not every sibling in the InstancedMesh.
 - `TransformControls` gizmo: `T` for translate (X/Y/Z all visible — Y
-  bypasses the surface clamp and writes through to the placement's
-  `offsetY` so manual lifts persist), `R` for rotate around Y. Snaps to
-  45°, hold Shift for free angle. **Listen to `objectChange`, not `change`**
-  — see `memory/tc_change_vs_objectchange.md`.
+  bypasses the surface clamp so manual lifts stick; the placement's exact
+  world Y then flows into the active save via `onPlacementUpdated` →
+  `SaveStore.updateFromMesh`), `R` for rotate around Y. Snaps to 45°, hold
+  Shift for free angle. **Listen to `objectChange`, not `change`** — see
+  `memory/tc_change_vs_objectchange.md`.
 - Floating inspector panel: numeric X/Z/rotation, ±45° steppers, NPC
   animation override, Delete + Duplicate.
 - Keyboard: Esc deselect, Delete/Backspace remove, Cmd/Ctrl+D duplicate,
   arrow keys nudge by `TILE_SIZE` (Shift+arrow for 1-unit fine).
 - Arming any placer auto-deselects.
 
-**Commit-edits persistence.** The "commit" button in the editor head bar
-POSTs each affected region's diff to `/api/dev/commit-edits?region=<id>`,
-which merges the diff into `packages/extractor/edits/<regionId>.json`
-(checked into git as source data) and re-runs `extractRegion`. The
-viewer then reloads the region from the freshly-baked bundle.
-`LocPlacement.offsetX/Z/Y` + `rotationY` round-trip sub-tile precision
-and non-cardinal rotation losslessly. **v1 scope:** Object adds +
-baked-loc removes only — NPCs/items/FX stay session-only. "Move a baked
-loc" isn't supported (delete + re-add). See `memory/editor_tools.md`
-for the full architecture.
+**Named map saves.** The map menu in the editor head bar saves the whole
+editable scene — baked-loc removes plus every NPC / object / item / FX
+placement — to `packages/extractor/saves/<slug>/` (one `manifest.json` plus
+one `<regionId>.json` per touched region, checked into git as source data).
+Saves apply as a *runtime overlay*: bundles under
+`packages/viewer/public/regions/` are always vanilla cache output, so
+switching maps or starting fresh is a scene reload, not a re-extract.
+`?save=<slug>` autoloads a map, `?save=none` forces vanilla, and the last
+opened save is remembered per browser. Export/import moves a save as one
+`.rsmap.json`. Design: `docs/superpowers/specs/2026-08-02-save-map-design.md`.
 
 **Obey-geometry ("stack") toggle.** When on, the placer + gizmo raycast
 loc groups + every placer's scene group on top of terrain, so placements
-rest on whatever's under the cursor. Object stacks survive commit via
-`LocPlacement.offsetY`. NPC/item/FX stacks are session-only.
+rest on whatever's under the cursor. Every placement kind's stack survives
+a save + reload — the save file stores each placement's exact world Y
+(`SavedPlacement.y`), so NPCs/items/FX stack just as durably as objects.
 
 ## Debug inspector
 
@@ -262,6 +264,9 @@ lazy-loaded on first Shift press so normal rendering has zero cost.
 | `packages/extractor/src/entities/spotAnimModel.ts` | Phase 9 SpotAnim baker + catalog |
 | `packages/extractor/scripts/reextract-all.ts` | Bulk re-extract every region (atlas-poisoning fix) |
 | `shared/src/region-bundle.ts` | shared on-disk schema types + `*_SCHEMA` constants |
+| `packages/viewer/src/saves/saveStore.ts` | active map save: tracking, per-region apply/detach |
+| `packages/extractor/src/saves/store.ts` | save file I/O (list / read / write / delete) |
+| `shared/src/save-file.ts` | shared save schema + `SAVE_SCHEMA` |
 | `docs/extraction-roadmap.md` | parked phases (audio / minimap / player / music / reactive var UI) |
 
 ## Commit / release hygiene

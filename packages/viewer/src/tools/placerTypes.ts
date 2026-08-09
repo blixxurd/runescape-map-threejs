@@ -47,7 +47,7 @@ export interface PlacedRef {
 
 /** Options for `Placer.spawnAt` — a world pose spawn that bypasses the
  *  armed-tool click flow. Used by the save store to re-materialize saved
- *  placements on region load, and by the legacy-edits importer. */
+ *  placements on region load. */
 export interface SpawnAtOptions {
   id: number;
   position: { x: number; y: number; z: number };
@@ -70,7 +70,8 @@ export interface Placer {
   /** Move + rotate a placement. By default Y is re-clamped to the surface
    *  at the new XZ. Pass `preserveY = true` to keep `position.y` exactly
    *  (used when the gizmo's Y handle is the active drag axis so the
-   *  user's manual lift writes through to `offsetY` on commit). */
+   *  user's manual lift sticks — `onPlacementUpdated` then carries the
+   *  mesh's exact Y into `SavedPlacement.y` via `SaveStore.updateFromMesh`). */
   updatePose(
     mesh: THREE.Mesh,
     position: THREE.Vector3,

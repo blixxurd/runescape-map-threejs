@@ -252,9 +252,11 @@ export function placeLocs(
       wz += disp * dz;
     }
 
-    // Free-place sub-tile offset (commit-edits adds only). Cache placements
-    // never set these; for them the fields are absent and the lookup is
-    // a no-op.
+    // Sub-tile offset. The extractor always bakes vanilla cache output, so
+    // these fields are absent on every current bundle and the lookup is a
+    // no-op — kept for forward-compat with the `LocPlacement` schema (see
+    // `shared/src/region-bundle.ts`) rather than anything actually setting
+    // them today.
     if (p.offsetX) wx += p.offsetX;
     if (p.offsetZ) wz += p.offsetZ;
 
@@ -276,10 +278,10 @@ export function placeLocs(
     // Polygon offset on the loc material is the *correct* fix in
     // theory, but its sub-pixel bias isn't reliable across all GPUs;
     // a real offset always works.
-    // Stack offset: obey-geometry placements (cat on box, etc.) record
-    // the height above terrain at their tile, applied here after the
-    // terrain sample so the placement re-renders at the same world Y on
-    // every re-bake.
+    // Stack offset — same forward-compat note as offsetX/offsetZ above.
+    // The in-viewer editor's own obey-geometry stacks don't flow through
+    // here at all: they're runtime placements positioned directly by the
+    // save system, not baked `LocPlacement`s.
     let wy = sampleTerrain(p.plane, wx, -wz) + LOC_TERRAIN_LIFT;
     if (p.offsetY) wy += p.offsetY;
     return { wx, wy, wz };
@@ -410,8 +412,9 @@ export function placeLocs(
   // Emit one InstancedMesh per (block, plane) pair that qualified.
   // Instance matrices are translation + optional Y-rotation. Cardinal
   // rotations are pre-baked into the block geometry by the extractor
-  // (cache convention); per-instance `rotationY` (radians) is the
-  // residual non-cardinal angle from the in-viewer free-rotation editor.
+  // (cache convention); per-instance `rotationY` (radians) would carry a
+  // residual non-cardinal angle, but nothing sets it today — see
+  // `LocPlacement.rotationY`'s doc comment for why the field still exists.
   for (const entry of instEntries) {
     const block = manifest.blocks[entry.blockIdx]!;
     const geom = geometries[entry.blockIdx]!;
@@ -466,9 +469,10 @@ export function placeLocs(
       const n = block.vertexCount;
       const { wx, wy, wz } = placementWorldPos(placementIdx, block);
       // Per-vertex rotation around world Y (right-hand rule: +Z → +X for
-      // positive angle). Free-rotation overlay adds bake the residual
-      // non-cardinal angle here; cache placements have rotationY = 0
-      // (cardinals are pre-baked into the block geometry already).
+      // positive angle). Cache placements always have rotationY = 0
+      // (cardinals are pre-baked into the block geometry already) — see
+      // `LocPlacement.rotationY`'s doc comment in `shared/src/region-
+      // bundle.ts` for why the field still exists.
       const rotationY = p.rotationY ?? 0;
       const cosR = rotationY === 0 ? 1 : Math.cos(rotationY);
       const sinR = rotationY === 0 ? 0 : Math.sin(rotationY);

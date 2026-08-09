@@ -365,10 +365,12 @@ export class InspectorPanel {
 
   /**
    * Read-only inspector for a baked-loc selection. v1 supports Delete only —
-   * the placement gets tombstoned in `pendingEdits` so the next "commit"
-   * removes it from the bundle. Editing position/rotation isn't wired up
-   * (v1 scope: delete-baked + add-fresh, no baked-loc moves). Use the
-   * Object placer to add a fresh placement at the new location instead.
+   * the placement's hash gets recorded as a "remove" in the active save
+   * (`SaveStore.addRemove`), which hides it in the scene immediately and
+   * keeps it hidden across a region reload once the save is written to
+   * disk. Editing position/rotation isn't wired up (v1 scope: hide-baked +
+   * add-fresh, no baked-loc moves). Use the Object placer to add a fresh
+   * placement at the new location instead.
    */
   private renderBaked(regionId: number, locHit: LocHit): void {
     const titleEl = this.head.querySelector<HTMLSpanElement>(".title")!;
@@ -411,14 +413,14 @@ export class InspectorPanel {
       this.body.appendChild(note);
     }
 
-    // Delete: tombstones the placement via the pending-edits store.
+    // Delete: records the placement as a "remove" in the active save.
     const actions = document.createElement("div");
     actions.className = "actions";
     const delBtn = document.createElement("button");
     delBtn.className = "action danger";
     delBtn.type = "button";
     delBtn.textContent = "delete";
-    delBtn.title = "tombstone for next commit (delete / backspace)";
+    delBtn.title = "hide this placement (delete / backspace)";
     if (locHit.placementIdHex === null) {
       delBtn.disabled = true;
       delBtn.title = "this bundle has no placementIds — re-extract to enable";
@@ -430,8 +432,8 @@ export class InspectorPanel {
     const hint = document.createElement("div");
     hint.className = "hint";
     hint.innerHTML =
-      `Edits stay in-session until you click <b>commit</b>. ` +
-      `Reload without committing to discard.`;
+      `Changes apply immediately but only live in this browser tab until ` +
+      `you <b>Save</b> the map. Reload without saving to discard.`;
     this.body.appendChild(hint);
 
     // Clear placed-only field refs so live-pose handlers (`updateFromPose`)

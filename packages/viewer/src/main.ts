@@ -961,28 +961,6 @@ async function main(): Promise<void> {
     client: saveClient,
     reloadRegions: reloadLoadedRegions,
     setStatus: (msg) => setHud(msg),
-    // THROWAWAY (see importLegacyEdits.ts). Migrates the pre-saves
-    // `packages/extractor/edits/<id>.json` overlay into live placements on
-    // the active map. Deleted in Task 10 along with the module + menu item.
-    importLegacy: async (overlay, run) => {
-      const o = overlay as { regionId: number };
-      const lr = regions.get(o.regionId);
-      if (!lr) throw new Error(`region ${o.regionId} is not loaded`);
-      return run({
-        overlay: overlay as never,
-        offsetX: lr.offsetX,
-        offsetZ: lr.offsetZ,
-        objectPlacer,
-        fetchSize: async (locId) => {
-          const r = await fetch(`/api/object/${locId}`);
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const body = (await r.json()) as { sizeX?: number; sizeY?: number };
-          return { sizeX: body.sizeX ?? 1, sizeY: body.sizeY ?? 1 };
-        },
-        sampleTerrainAt,
-        onRemove: (regionId, hex) => saveStore.addRemove(regionId, hex),
-      });
-    },
   });
   mapMenu.mount(toolPanel.getMapSlot());
 

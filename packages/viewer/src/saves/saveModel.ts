@@ -37,8 +37,8 @@ export function regionOriginFor(
 }
 
 /** Which region owns this world position? Returns null outside the
- *  256×256 cache grid. Mirrors `worldToTile`'s region math in `main.ts`
- *  without the tile subdivision. */
+ *  256×256 cache grid. Same region-attribution math `main.ts` uses when
+ *  streaming regions in around the camera, minus the tile subdivision. */
 export function worldToRegionId(
   worldX: number,
   worldZ: number,
