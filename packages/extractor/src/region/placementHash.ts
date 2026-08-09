@@ -1,9 +1,6 @@
 /**
  * 32-bit FNV-1a hash → 8-char lowercase hex. Stable per-placement identity
- * derived purely from cache-record fields — no I/O, no repo-relative paths
- * (the old rationale for resolving `REPO_ROOT` locally in this file applied
- * to the on-disk edits overlay that used to live here; it's gone along with
- * the overlay, and this function never needed it).
+ * derived purely from cache-record fields — no I/O, no repo-relative paths.
  *
  * Written into `locs.placementIds.bin` by `emitLocs` (`./locs.js`) and read
  * back by the viewer's save system (`packages/viewer/src/saves/`), which

@@ -114,7 +114,7 @@ interface PlacedEntity {
   mesh: THREE.Mesh;
   id: number;
   name: string;
-  /** OSRS plane (0..3) the placement was committed to. Used by
+  /** OSRS plane (0..3) the placement was spawned on. Used by
    *  `updatePose` to re-sample terrain Y on the same floor; without this,
    *  dragging a plane-1 placement would snap it back to ground. */
   plane: number;
@@ -242,10 +242,10 @@ export class ModelPlacer implements Placer {
    *  and spotanims all round-trip the same way. */
   private obeyGeometry = false;
 
-  /** OSRS plane (0..3) the next placement will be committed to. Adjusted
-   *  with `,` (down) and `.` (up) while the placer is armed. The ghost
-   *  preview lifts to the chosen plane's terrain Y immediately so the user
-   *  sees what they'll get on commit. Reset to 0 on cancel. */
+  /** OSRS plane (0..3) the next placement will spawn on. Adjusted with `,`
+   *  (down) and `.` (up) while the placer is armed. The ghost preview lifts
+   *  to the chosen plane's terrain Y immediately so the user sees what
+   *  they'll get before clicking. Reset to 0 on cancel. */
   private placementPlane = 0;
 
   /** Mirrors the physical Shift key. When held AND a placer is armed we
@@ -438,7 +438,7 @@ export class ModelPlacer implements Placer {
     this.refreshGhostFromLastHit();
   }
 
-  /** Read-only — the plane the next placement will commit to. */
+  /** Read-only — the plane the next placement will spawn on. */
   getPlacementPlane(): number {
     return this.placementPlane;
   }
@@ -517,8 +517,9 @@ export class ModelPlacer implements Placer {
    *
    *  `preserveY = true` skips the resample and writes `position.y` through
    *  unchanged. Used when the gizmo's Y handle is the active drag axis so
-   *  the user's manual lift translates into a non-zero `offsetY` on the
-   *  pending edit instead of fighting the surface clamp. */
+   *  the user's manual lift sticks — `onPlacementUpdated` then carries the
+   *  mesh's exact Y into `SavedPlacement.y` via `SaveStore.updateFromMesh`,
+   *  instead of fighting the surface clamp. */
   updatePose(
     mesh: THREE.Mesh,
     position: THREE.Vector3,

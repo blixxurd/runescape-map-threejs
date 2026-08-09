@@ -95,8 +95,8 @@ export class Selection {
    * temporarily hide the original (zero-scale the instance slot, or
    * zero-vertex the merged triangles) so the ghost stands in for it
    * without Z-fighting. On deselect we restore the original. On Delete
-   * we keep the original hidden (the tombstone makes the hide permanent
-   * pre-commit) and just discard the ghost.
+   * we keep the original hidden (the save-store remove makes the hide
+   * permanent for the session) and just discard the ghost.
    */
   private outlineGhost: OutlineGhost | null = null;
 
@@ -156,8 +156,10 @@ export class Selection {
       // gizmo's `axis` is exactly "Y" (TransformControls suppresses hover
       // updates while `dragging === true`, so the value sticks for the
       // whole drag). In that case skip the surface resample so the lift
-      // writes through to `offsetY` on commit. Other axes / combined
-      // drags still resample so XZ motion settles on the new tile or stack.
+      // sticks — `onPlacementUpdated` then carries the mesh's exact Y into
+      // `SavedPlacement.y` via `SaveStore.updateFromMesh`. Other axes /
+      // combined drags still resample so XZ motion settles on the new tile
+      // or stack.
       const mesh = this.current.ref.mesh;
       const axis = (this.transformControls as { axis?: string | null }).axis;
       const preserveY = axis === "Y";
@@ -206,8 +208,9 @@ export class Selection {
 
   /** Discard the outline ghost. When `restore` is true, also undo the
    *  temporary hide on the source mesh — used on plain deselect. Skip
-   *  restore on Delete so the tombstoned placement stays hidden until
-   *  re-bake. */
+   *  restore on Delete so the placement stays hidden — permanently for
+   *  the session, since nothing re-bakes the bundle (see
+   *  `tombstoneBakedSelection`'s doc comment). */
   private clearOutlineGhost(restore: boolean): void {
     if (!this.outlineGhost) return;
     const g = this.outlineGhost;
@@ -288,9 +291,11 @@ export class Selection {
     if (this.gizmoMode === "translate") {
       // All three axes available. Dragging X/Z still triggers a terrain
       // re-clamp (placements settle on the new tile / new stack); dragging
-      // Y bypasses the clamp and writes directly to `offsetY` so the user
-      // can lift a stack manually. The bypass is implemented in the
-      // change handler below by checking `transformControls.axis`.
+      // Y bypasses the clamp and writes `position.y` straight through so
+      // the user can lift a stack manually — see `updatePose`'s doc
+      // comment in `modelPlacer.ts` for where that Y ends up persisted.
+      // The bypass is implemented in the change handler below by checking
+      // `transformControls.axis`.
       this.transformControls.showX = true;
       this.transformControls.showY = true;
       this.transformControls.showZ = true;
