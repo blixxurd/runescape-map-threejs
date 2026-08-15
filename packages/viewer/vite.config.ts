@@ -15,7 +15,10 @@ import type {
   buildSpotAnimCatalog as BuildSpotAnimCatalogFn,
   buildSequenceCatalog as BuildSequenceCatalogFn,
   buildGlobalAtlas as BuildGlobalAtlasFn,
-  mergeAndSaveEdits as MergeAndSaveEditsFn,
+  listSaves as ListSavesFn,
+  readSave as ReadSaveFn,
+  writeSave as WriteSaveFn,
+  deleteSave as DeleteSaveFn,
   BakedAtlas,
   NpcCatalogEntry,
   ObjectCatalogEntry,
@@ -24,25 +27,6 @@ import type {
   SequenceCatalogEntry,
 } from "@rsmap/extractor";
 import { defineConfig } from "vite";
-
-/** Wire-format diff sent from the viewer's commit button. Shape mirrors
- *  `EditsOverlay` minus the schemaVersion — server applies that. */
-interface CommitEditsDiff {
-  removes: string[];
-  adds: Array<{
-    locId: number;
-    plane: number;
-    tileX: number;
-    tileZ: number;
-    type: number;
-    rotation: number;
-    animationOverride: number | null;
-    offsetX?: number;
-    offsetZ?: number;
-    offsetY?: number;
-    rotationY?: number;
-  }>;
-}
 
 /**
  * Dev middleware — let the viewer trigger a region extraction when its
@@ -74,7 +58,10 @@ function autoExtractPlugin(): Plugin {
     buildSpotAnimCatalog: typeof BuildSpotAnimCatalogFn;
     buildSequenceCatalog: typeof BuildSequenceCatalogFn;
     buildGlobalAtlas: typeof BuildGlobalAtlasFn;
-    mergeAndSaveEdits: typeof MergeAndSaveEditsFn;
+    listSaves: typeof ListSavesFn;
+    readSave: typeof ReadSaveFn;
+    writeSave: typeof WriteSaveFn;
+    deleteSave: typeof DeleteSaveFn;
   }
 
   let extractorModule: ExtractorModule | null = null;
@@ -172,46 +159,23 @@ function autoExtractPlugin(): Plugin {
     });
   }
 
-  /** Per-region commit mutex. Serialises commit-edit operations for the
-   *  same region so two rapid commits can't interleave save+extract steps.
-   *  Concurrent commits to *different* regions still run in parallel —
-   *  they only serialise behind `queueTail` inside `enqueueExtract`. */
-  const commitMutex = new Map<number, Promise<unknown>>();
+  /** Per-slug mutex. `writeSave` is multi-step (write region files → write
+   *  manifest → prune stale files) and `deleteSave` removes the whole
+   *  directory — two overlapping requests for the same slug (a
+   *  double-clicked Save, or a Save racing a Delete) could otherwise
+   *  interleave those steps and leave the manifest naming a region file a
+   *  concurrent op just deleted. */
+  const saveMutex = new Map<string, Promise<unknown>>();
 
-  /**
-   * Apply a commit-edits diff to a region's overlay file and re-bake the
-   * bundle. Coordinates three kinds of work that mustn't interleave:
-   *
-   *   1. Any in-flight extract for this region (started by a neighbour
-   *      streaming pass or a stale viewer fetch) must finish first —
-   *      otherwise that extract reads the previous overlay state and
-   *      writes a bundle that doesn't reflect our edit.
-   *   2. Save the merged overlay to disk.
-   *   3. Enqueue a fresh extract; await it so the HTTP response only goes
-   *      out once the bundle is written.
-   */
-  async function commitEditsForRegion(
-    server: ViteDevServer,
-    regionId: number,
-    diff: CommitEditsDiff,
-  ): Promise<void> {
-    const mod = await loadModule(server);
-    const prev = commitMutex.get(regionId) ?? Promise.resolve();
-    const job = prev.then(async () => {
-      // Drain any extract that started before us — its overlay snapshot is
-      // stale by definition, so we wait it out instead of letting it stomp
-      // our bundle.
-      const inflightExtract = inflight.get(regionId);
-      if (inflightExtract) await inflightExtract.catch(() => undefined);
-      await mod.mergeAndSaveEdits(regionId, diff);
-      await enqueueExtract(server, regionId);
-    });
-    // Don't poison future commits if this one fails.
-    commitMutex.set(
-      regionId,
+  async function withSaveMutex<T>(slug: string, run: () => Promise<T>): Promise<T> {
+    const prev = saveMutex.get(slug) ?? Promise.resolve();
+    const job = prev.then(run);
+    // Don't poison future ops on this slug if this one fails.
+    saveMutex.set(
+      slug,
       job.catch(() => undefined),
     );
-    await job;
+    return job;
   }
 
   async function getNpcCatalog(server: ViteDevServer): Promise<NpcCatalogEntry[]> {
@@ -486,134 +450,65 @@ function autoExtractPlugin(): Plugin {
           return;
         }
 
-        if (
-          req.url === "/api/dev/commit-edits" ||
-          req.url.startsWith("/api/dev/commit-edits?")
-        ) {
-          if (req.method !== "POST") {
-            writeJson(res, 405, { error: "POST required" });
-            return;
-          }
-          const url = new URL(req.url, "http://localhost");
-          const regionParam = url.searchParams.get("region");
-          const regionId = Number(regionParam);
-          if (!Number.isInteger(regionId) || regionId < 0 || regionId > 0xffff) {
-            writeJson(res, 400, { error: `invalid region id: ${regionParam}` });
-            return;
-          }
-
-          let raw: unknown;
+        if (req.url === "/api/dev/saves" || req.url.startsWith("/api/dev/saves?")) {
+          const mod = await loadModule(server);
           try {
-            raw = await readJsonBody(req);
-          } catch (e) {
-            writeJson(res, 400, { error: `invalid body: ${(e as Error).message}` });
-            return;
-          }
-          const body = raw as Partial<CommitEditsDiff> | null;
-          if (!body || typeof body !== "object") {
-            writeJson(res, 400, { error: "expected JSON object body" });
-            return;
-          }
-          const removes = Array.isArray(body.removes) ? body.removes : [];
-          const adds = Array.isArray(body.adds) ? body.adds : [];
-
-          // Validate `removes` are 8-char hex placement IDs.
-          for (const h of removes) {
-            if (typeof h !== "string" || !/^[0-9a-f]{8}$/.test(h)) {
-              writeJson(res, 400, { error: `invalid placement id: ${String(h)}` });
-              return;
-            }
-          }
-          // Validate `adds` field-by-field. We deliberately DON'T check
-          // locId against the object catalog — the catalog filters out
-          // entries with `name === "null"`, but the eyedropper + placer
-          // happily round-trip those ids (any baked-loc you can click
-          // is a valid id). The extractor logs `noDef` for genuine
-          // typos, which is enough surface area.
-          const intIn = (v: unknown, lo: number, hi: number): boolean =>
-            typeof v === "number" && Number.isInteger(v) && v >= lo && v <= hi;
-          for (const a of adds) {
-            if (!a || typeof a !== "object") {
-              writeJson(res, 400, { error: "add must be an object" });
-              return;
-            }
-            if (!intIn(a.locId, 0, 0xfffff)) {
-              writeJson(res, 400, { error: `invalid locId: ${String(a.locId)}` });
-              return;
-            }
-            if (!intIn(a.plane, 0, 3)) {
-              writeJson(res, 400, { error: `invalid plane: ${String(a.plane)}` });
-              return;
-            }
-            if (!intIn(a.tileX, 0, 63) || !intIn(a.tileZ, 0, 63)) {
-              writeJson(res, 400, {
-                error: `invalid tile coords: ${String(a.tileX)},${String(a.tileZ)}`,
-              });
-              return;
-            }
-            if (!intIn(a.type, 0, 22)) {
-              writeJson(res, 400, { error: `invalid type: ${String(a.type)}` });
-              return;
-            }
-            if (!intIn(a.rotation, 0, 3)) {
-              writeJson(res, 400, { error: `invalid rotation: ${String(a.rotation)}` });
-              return;
-            }
-            if (
-              a.animationOverride !== null &&
-              !intIn(a.animationOverride, 0, 0xffffff)
-            ) {
-              writeJson(res, 400, {
-                error: `invalid animationOverride: ${String(a.animationOverride)}`,
-              });
-              return;
-            }
-            // Sub-tile offsets are world-unit fractions; allow up to one
-            // full tile in either direction (placer-side shouldn't ever
-            // exceed half a tile, but be lenient in case someone hand-
-            // edits the overlay).
-            const numIn = (v: unknown, lo: number, hi: number): boolean =>
-              typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
-            if (a.offsetX !== undefined && !numIn(a.offsetX, -128, 128)) {
-              writeJson(res, 400, { error: `invalid offsetX: ${String(a.offsetX)}` });
-              return;
-            }
-            if (a.offsetZ !== undefined && !numIn(a.offsetZ, -128, 128)) {
-              writeJson(res, 400, { error: `invalid offsetZ: ${String(a.offsetZ)}` });
-              return;
-            }
-            // Y stack offset — practically bounded by how tall a stack a
-            // user is plausibly building. 4096 units = 32 tiles of stack,
-            // way past any reasonable scene editing height. Negative
-            // values let placements sink below terrain (basements, pits).
-            if (a.offsetY !== undefined && !numIn(a.offsetY, -4096, 4096)) {
-              writeJson(res, 400, { error: `invalid offsetY: ${String(a.offsetY)}` });
-              return;
-            }
-            // Residual rotation is bounded by the cardinal decomposition's
-            // range (−π/4..π/4]. Be lenient — accept the full circle in
-            // case a hand-edit happens to record an un-normalised value.
-            const TWO_PI = Math.PI * 2;
-            if (a.rotationY !== undefined && !numIn(a.rotationY, -TWO_PI, TWO_PI)) {
-              writeJson(res, 400, { error: `invalid rotationY: ${String(a.rotationY)}` });
-              return;
-            }
-          }
-
-          try {
-            server.config.logger.info(
-              `[commit-edits] region ${regionId}: ${removes.length} removes, ${adds.length} adds`,
-            );
-            await commitEditsForRegion(server, regionId, {
-              removes,
-              adds: adds as CommitEditsDiff["adds"],
-            });
-            writeJson(res, 200, { ok: true, regionId });
+            writeJson(res, 200, { saves: await mod.listSaves() });
           } catch (err) {
-            server.config.logger.error(
-              `[commit-edits] region ${regionId} failed: ${(err as Error).message}`,
-            );
-            writeJson(res, 500, { error: (err as Error).message, regionId });
+            writeJson(res, 500, { error: (err as Error).message });
+          }
+          return;
+        }
+
+        if (req.url.startsWith("/api/dev/saves/")) {
+          const slug = decodeURIComponent(
+            new URL(req.url, "http://localhost").pathname.slice("/api/dev/saves/".length),
+          );
+          if (!/^[a-z0-9-]+$/.test(slug)) {
+            writeJson(res, 400, { error: `invalid save slug: ${slug}` });
+            return;
+          }
+          const mod = await loadModule(server);
+          try {
+            if (req.method === "GET") {
+              const bundle = await mod.readSave(slug);
+              if (!bundle) {
+                writeJson(res, 404, { error: `no such save: ${slug}` });
+                return;
+              }
+              writeJson(res, 200, bundle);
+              return;
+            }
+            if (req.method === "PUT") {
+              const body = await readJsonBody(req);
+              // writeSave re-parses and throws on anything malformed, so
+              // the endpoint doesn't duplicate field validation — but the
+              // URL slug is the caller's routing intent, and writeSave
+              // files under `body.manifest.slug` instead. Reject a
+              // mismatch rather than silently writing to a different
+              // directory than the URL says.
+              const bodySlug = (body as { manifest?: { slug?: unknown } } | null)?.manifest
+                ?.slug;
+              if (bodySlug !== slug) {
+                writeJson(res, 400, {
+                  error: `body manifest.slug (${JSON.stringify(bodySlug)}) does not match URL slug "${slug}"`,
+                });
+                return;
+              }
+              await withSaveMutex(slug, () => mod.writeSave(body as never));
+              server.config.logger.info(`[saves] wrote ${slug}`);
+              writeJson(res, 200, { ok: true, slug });
+              return;
+            }
+            if (req.method === "DELETE") {
+              const ok = await withSaveMutex(slug, () => mod.deleteSave(slug));
+              writeJson(res, ok ? 200 : 404, ok ? { ok: true, slug } : { error: "not found" });
+              return;
+            }
+            writeJson(res, 405, { error: "GET, PUT or DELETE required" });
+          } catch (err) {
+            server.config.logger.error(`[saves] ${slug} failed: ${(err as Error).message}`);
+            writeJson(res, 400, { error: (err as Error).message });
           }
           return;
         }

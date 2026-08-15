@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/region-bundle.ts"
+    ".": "./src/region-bundle.ts",
+    "./save-file": "./src/save-file.ts"
   }
 }

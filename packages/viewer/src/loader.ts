@@ -63,9 +63,9 @@ export interface RegionData {
    *  when no animated blocks exist in the region. */
   locsFramesPositions: Float32Array;
   /** Per-placement stable ID, parallel to `locs.placements` by index.
-   *  Uint32 hash from the extractor; the viewer hands the hex form back to
-   *  the dev server's commit-edits endpoint as a "remove" tombstone. Empty
-   *  when the region has no placements. */
+   *  Uint32 hash from the extractor; the viewer converts it to the hex form
+   *  used as a "remove" entry in the active save when a baked loc is
+   *  deleted. Empty when the region has no placements. */
   locsPlacementIds: Uint32Array;
 }
 

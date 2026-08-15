@@ -18,7 +18,7 @@ export interface LocHit {
   locId: number;
   /** 8-char lowercase hex placement ID. `null` when the bundle has no
    *  placementIds blob (legacy / empty regions). Selection can still
-   *  outline the hit; only commit-edit removes need the hex form. */
+   *  outline the hit; only save removes need the hex form. */
   placementIdHex: string | null;
   /** Filled for InstancedMesh hits, null for merged-mesh hits. The Delete
    *  path uses this to zero-scale a single instance's matrix. */

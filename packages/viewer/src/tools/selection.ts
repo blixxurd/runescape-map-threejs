@@ -7,7 +7,8 @@ import type { LocsManifest } from "@rsmap/shared";
 import { TILE_SIZE } from "@rsmap/shared";
 import type { Placer, PlacedRef } from "./placerTypes.js";
 import { resolveLocHit, type LocHit } from "./locResolve.js";
-import type { PendingEdits } from "./pendingEdits.js";
+import type { SaveStore } from "../saves/saveStore.js";
+import { SUNK_Y, hideInstancedSlot, hideMergedTriangles } from "../locs/hideLoc.js";
 
 /**
  * Selection: click-to-select either a user-placed entity (NPC / object /
@@ -19,7 +20,7 @@ import type { PendingEdits } from "./pendingEdits.js";
  *   - `kind: "placed"` — full editor support: gizmo, numeric pose inputs,
  *     duplicate, animation override, arrow-key nudge.
  *   - `kind: "baked"` — read-only inspector + Delete (records a tombstone
- *     in `PendingEdits` and zero-scales the InstancedMesh slot or zero-
+ *     in `SaveStore` and zero-scales the InstancedMesh slot or zero-
  *     vertexes the merged-mesh triangles for instant feedback). Does not
  *     attach the TransformControls — moving baked locs is out of scope
  *     for v1; users delete + re-place via the Object placer instead.
@@ -61,8 +62,8 @@ export interface SelectionHost {
   /** Loaded regions to also raycast against (for baked-loc clicks). Same
    *  per-call pattern — fresh stream-loaded regions show up automatically. */
   getRegions: () => SelectionRegion[];
-  /** Pending-edits store. Baked-loc Delete records a tombstone here. */
-  pendingEdits: PendingEdits;
+  /** Active map save. Baked-loc Delete records a tombstone here. */
+  saveStore: SaveStore;
   /** Returns true if some other tool (placer / eyedropper) is currently
    *  armed. Selection bails on click when true so it doesn't fight with
    *  placement clicks. */
@@ -94,8 +95,8 @@ export class Selection {
    * temporarily hide the original (zero-scale the instance slot, or
    * zero-vertex the merged triangles) so the ghost stands in for it
    * without Z-fighting. On deselect we restore the original. On Delete
-   * we keep the original hidden (the tombstone makes the hide permanent
-   * pre-commit) and just discard the ghost.
+   * we keep the original hidden (the save-store remove makes the hide
+   * permanent for the session) and just discard the ghost.
    */
   private outlineGhost: OutlineGhost | null = null;
 
@@ -155,8 +156,10 @@ export class Selection {
       // gizmo's `axis` is exactly "Y" (TransformControls suppresses hover
       // updates while `dragging === true`, so the value sticks for the
       // whole drag). In that case skip the surface resample so the lift
-      // writes through to `offsetY` on commit. Other axes / combined
-      // drags still resample so XZ motion settles on the new tile or stack.
+      // sticks — `onPlacementUpdated` then carries the mesh's exact Y into
+      // `SavedPlacement.y` via `SaveStore.updateFromMesh`. Other axes /
+      // combined drags still resample so XZ motion settles on the new tile
+      // or stack.
       const mesh = this.current.ref.mesh;
       const axis = (this.transformControls as { axis?: string | null }).axis;
       const preserveY = axis === "Y";
@@ -205,8 +208,9 @@ export class Selection {
 
   /** Discard the outline ghost. When `restore` is true, also undo the
    *  temporary hide on the source mesh — used on plain deselect. Skip
-   *  restore on Delete so the tombstoned placement stays hidden until
-   *  re-bake. */
+   *  restore on Delete so the placement stays hidden — permanently for
+   *  the session, since nothing re-bakes the bundle (see
+   *  `tombstoneBakedSelection`'s doc comment). */
   private clearOutlineGhost(restore: boolean): void {
     if (!this.outlineGhost) return;
     const g = this.outlineGhost;
@@ -262,7 +266,7 @@ export class Selection {
   }
 
   /** Delete the current selection through the kind-appropriate path:
-   *  placed → placer.removeMesh, baked → tombstone in pendingEdits +
+   *  placed → placer.removeMesh, baked → tombstone in the save store +
    *  hide the slot/triangles. Used by the inspector panel's Delete
    *  button so the same button works for both selection kinds. */
   deleteSelection(): void {
@@ -287,9 +291,11 @@ export class Selection {
     if (this.gizmoMode === "translate") {
       // All three axes available. Dragging X/Z still triggers a terrain
       // re-clamp (placements settle on the new tile / new stack); dragging
-      // Y bypasses the clamp and writes directly to `offsetY` so the user
-      // can lift a stack manually. The bypass is implemented in the
-      // change handler below by checking `transformControls.axis`.
+      // Y bypasses the clamp and writes `position.y` straight through so
+      // the user can lift a stack manually — see `updatePose`'s doc
+      // comment in `modelPlacer.ts` for where that Y ends up persisted.
+      // The bypass is implemented in the change handler below by checking
+      // `transformControls.axis`.
       this.transformControls.showX = true;
       this.transformControls.showY = true;
       this.transformControls.showZ = true;
@@ -433,9 +439,10 @@ export class Selection {
   }
 
   /**
-   * Record the baked selection as a "remove" in `pendingEdits` and hide it
-   * from the scene immediately so the user sees the deletion before the
-   * eventual re-bake. Visual feedback differs by mesh kind:
+   * Record the baked selection as a "remove" in the save store and hide it
+   * from the scene immediately — the hide is permanent for the session
+   * (and for any future load of this save) since nothing re-bakes the
+   * bundle. Visual feedback differs by mesh kind:
    *   - InstancedMesh: zero-scale + sink the matrix at this slot. Cheap;
    *     the slot stays allocated and re-render produces no fragments.
    *   - merged Mesh: zero out the affected triangles' vertex positions in
@@ -454,7 +461,7 @@ export class Selection {
       );
       return;
     }
-    this.host.pendingEdits.addRemove(regionId, locHit.placementIdHex);
+    this.host.saveStore.addRemove(regionId, locHit.placementIdHex);
     // The outline ghost has already hidden the source instance/triangles
     // for visual feedback (see selectBaked). For Delete we keep that hide
     // in place — drop the ghost without restoring.
@@ -535,11 +542,6 @@ function findOwningRegion(
   return null;
 }
 
-/** Sentinel Y used when hiding loc geometry pre-commit. Placing degenerate
- *  triangles deep underground keeps them out of any plausible camera view
- *  and well clear of the (0,0,0) world origin where stray hits would be
- *  most surprising. */
-const SUNK_Y = -1e6;
 
 /** Outline-ghost record — see Selection.outlineGhost. Discriminated by
  *  source mesh kind so restore knows whether to re-set an instance matrix
@@ -699,35 +701,4 @@ function makeOutlineGhost(locHit: LocHit): OutlineGhost | null {
   return null;
 }
 
-/** Zero-scale a single InstancedMesh slot and sink it underground. The
- *  slot stays allocated; the per-instance matrix is degenerate so the
- *  fragment shader produces no output and raycasts find no hit. */
-function hideInstancedSlot(inst: THREE.InstancedMesh, instanceId: number): void {
-  const m = new THREE.Matrix4();
-  m.makeScale(0, 0, 0);
-  m.setPosition(0, SUNK_Y, 0);
-  inst.setMatrixAt(instanceId, m);
-  inst.instanceMatrix.needsUpdate = true;
-}
 
-/** Collapse every triangle owned by `placementIdx` in a merged-loc Mesh's
- *  position buffer to a single point at SUNK_Y. The merged buffer is
- *  owned by this mesh alone (`placeLocs` mints a fresh Float32Array) so
- *  in-place mutation doesn't affect any other placement. */
-function hideMergedTriangles(mesh: THREE.Mesh, placementIdx: number): void {
-  const placementByTri = (mesh.userData as { placementByTri?: Uint32Array })
-    .placementByTri;
-  if (!placementByTri) return;
-  const posAttr = mesh.geometry.attributes.position as THREE.BufferAttribute;
-  const positions = posAttr.array as Float32Array;
-  for (let t = 0; t < placementByTri.length; t++) {
-    if (placementByTri[t] !== placementIdx) continue;
-    // Each triangle = 3 vertices = 9 floats. Collapse all three vertices
-    // to (0, SUNK_Y, 0) — degenerate zero-area, no rasterised fragments.
-    const off = t * 9;
-    positions[off + 0] = 0; positions[off + 1] = SUNK_Y; positions[off + 2] = 0;
-    positions[off + 3] = 0; positions[off + 4] = SUNK_Y; positions[off + 5] = 0;
-    positions[off + 6] = 0; positions[off + 7] = SUNK_Y; positions[off + 8] = 0;
-  }
-  posAttr.needsUpdate = true;
-}

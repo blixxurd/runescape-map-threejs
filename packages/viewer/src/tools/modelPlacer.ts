@@ -5,6 +5,7 @@ import type {
   PlacedRef,
   Placer,
   PlacerKind,
+  SpawnAtOptions,
 } from "./placerTypes.js";
 
 /**
@@ -59,16 +60,18 @@ interface CachedEntity {
   geometry: THREE.BufferGeometry;
   name: string;
   /** Present only on `/api/object` responses. The OSRS placement type
-   *  (0..22) the bake chose for this loc. Used by the commit-edits hook
-   *  so the cache add records the right type. */
+   *  (0..22) the bake chose for this loc — wall (0..3), wall decor (4..8),
+   *  normal scenery (10), floor decor (22). Reported via
+   *  `onPlacementSpawned` and stored on the save file as
+   *  `SavedPlacement.type` so re-materializing a save doesn't need to
+   *  re-derive it. */
   modelType?: number;
   /** Present only on `/api/object` responses. ObjectDefinition.sizeX/Y —
-   *  the bbox tile footprint of the loc in cache coords (1..N). The
-   *  commit-edits hook uses these to compensate for `placeLocs`'
-   *  bbox-center positioning of type 10/11 placements: a 2×1 loc clicked
-   *  at tile (a, b) ends up rendered at world `(a*128 + 128, _, -(b*128 +
-   *  64))` post-bake, so the overlay must record an `offsetX = -64` to
-   *  cancel the half-cell shift. */
+   *  the bbox tile footprint of the loc in cache coords (1..N). Reported
+   *  via `onPlacementSpawned` alongside `modelType`, but the save system
+   *  doesn't need it: a save stores each placement's exact world (x, y, z),
+   *  not a tile + bbox-center offset, so there's no footprint math to
+   *  compensate for. */
   sizeX?: number;
   sizeY?: number;
   /** Present only on `/api/object` responses. `undefined` → rigid model.
@@ -111,7 +114,7 @@ interface PlacedEntity {
   mesh: THREE.Mesh;
   id: number;
   name: string;
-  /** OSRS plane (0..3) the placement was committed to. Used by
+  /** OSRS plane (0..3) the placement was spawned on. Used by
    *  `updatePose` to re-sample terrain Y on the same floor; without this,
    *  dragging a plane-1 placement would snap it back to ground. */
   plane: number;
@@ -153,9 +156,9 @@ interface BakedResponse {
   uvs: number[];
   /** Objects only — the OSRS placement type (0..22) the bake picked from
    *  the def's `objectTypes`. Walls (0..3), wall decor (4..8), normal
-   *  scenery (10), floor decor (22). The commit-edits hook needs this
-   *  so the re-extracted placement uses the SAME type the user saw —
-   *  hardcoding 10 silently dropped fences/doors during re-bake. */
+   *  scenery (10), floor decor (22). Carried through to `CachedEntity
+   *  .modelType` and from there into the save file — see that field's
+   *  doc comment. */
   modelType?: number;
   /** Objects only — `ObjectDefinition.sizeX/sizeY`. See `CachedEntity`. */
   sizeX?: number;
@@ -233,17 +236,16 @@ export class ModelPlacer implements Placer {
   /** When `true`, the cursor + placement-Y resolution test loc geometry +
    *  every placer's scene meshes alongside terrain. Lets users stack a
    *  cat on a box on a table. Off by default so the simple "drop on the
-   *  ground" path stays fast and predictable. NPCs/items/spotanims live
-   *  in scene memory only, so stacking these is purely cosmetic; objects
-   *  CAN be stacked too but the on-disk overlay schema doesn't carry a Y
-   *  offset yet (see `EditsOverlayAdd`), so committed stacked objects
-   *  snap back to terrain on re-bake. */
+   *  ground" path stays fast and predictable. The save file stores each
+   *  placement's exact world Y (`SavedPlacement.y`), so a stack survives a
+   *  save + reload regardless of placement kind — NPCs, objects, items,
+   *  and spotanims all round-trip the same way. */
   private obeyGeometry = false;
 
-  /** OSRS plane (0..3) the next placement will be committed to. Adjusted
-   *  with `,` (down) and `.` (up) while the placer is armed. The ghost
-   *  preview lifts to the chosen plane's terrain Y immediately so the user
-   *  sees what they'll get on commit. Reset to 0 on cancel. */
+  /** OSRS plane (0..3) the next placement will spawn on. Adjusted with `,`
+   *  (down) and `.` (up) while the placer is armed. The ghost preview lifts
+   *  to the chosen plane's terrain Y immediately so the user sees what
+   *  they'll get before clicking. Reset to 0 on cancel. */
   private placementPlane = 0;
 
   /** Mirrors the physical Shift key. When held AND a placer is armed we
@@ -259,16 +261,15 @@ export class ModelPlacer implements Placer {
    *  selection's Delete key). Selection listens so it can clear stale
    *  state if the removed mesh was the current selection. */
   onMeshRemoved: ((mesh: THREE.Mesh) => void) | null = null;
-  /** Fired when a new placement spawns from a click or duplicate. Used by
-   *  the commit-edits hook to register the spawn in `PendingEdits`.
-   *  `modelType` is the OSRS placement type (0..22) the bake chose for
-   *  this loc — wall (0..3), wall decor (4..8), normal scenery (10),
-   *  floor decor (22). NPCs/items/spotanims pass `undefined`.
+  /** Fired when a new placement spawns from a click or duplicate. `main.ts`
+   *  wires this to `SaveStore.trackSpawn` so the active map picks up the
+   *  placement. `modelType` is the OSRS placement type (0..22) the bake
+   *  chose for this loc — wall (0..3), wall decor (4..8), normal scenery
+   *  (10), floor decor (22). NPCs/items/spotanims pass `undefined`.
    *  `sizeX`/`sizeY` are `ObjectDefinition.sizeX/sizeY` (1..N tile
-   *  footprint), needed by the commit-edits hook to compensate for
-   *  bbox-center positioning of multi-tile type-10/11 locs. Undefined
-   *  for non-objects. `plane` is the OSRS plane (0..3) at which to commit
-   *  the placement. */
+   *  footprint); the save store doesn't currently use them (see
+   *  `CachedEntity.sizeX`). `plane` is the OSRS plane (0..3) the
+   *  placement was dropped on. */
   onPlacementSpawned:
     | ((
         mesh: THREE.Mesh,
@@ -284,8 +285,9 @@ export class ModelPlacer implements Placer {
    *  Tool panel listens so the armed banner can show "plane N". */
   onPlacementPlaneChanged: ((plane: number) => void) | null = null;
   /** Fired when an existing placement's pose changes (gizmo drag, numeric
-   *  input, arrow nudge). Lets the commit-edits hook update the matching
-   *  `EditsOverlayAdd`. */
+   *  input, arrow nudge). `main.ts` wires this to
+   *  `SaveStore.updateFromMesh` so the active map's copy of the placement
+   *  stays in sync. */
   onPlacementUpdated: ((mesh: THREE.Mesh) => void) | null = null;
   /** Fires once per successful `arm()` with whatever animation metadata
    *  the server returned (NPC-only today). Lets the panel show a picker
@@ -436,7 +438,7 @@ export class ModelPlacer implements Placer {
     this.refreshGhostFromLastHit();
   }
 
-  /** Read-only — the plane the next placement will commit to. */
+  /** Read-only — the plane the next placement will spawn on. */
   getPlacementPlane(): number {
     return this.placementPlane;
   }
@@ -515,8 +517,9 @@ export class ModelPlacer implements Placer {
    *
    *  `preserveY = true` skips the resample and writes `position.y` through
    *  unchanged. Used when the gizmo's Y handle is the active drag axis so
-   *  the user's manual lift translates into a non-zero `offsetY` on the
-   *  pending edit instead of fighting the surface clamp. */
+   *  the user's manual lift sticks — `onPlacementUpdated` then carries the
+   *  mesh's exact Y into `SavedPlacement.y` via `SaveStore.updateFromMesh`,
+   *  instead of fighting the surface clamp. */
   updatePose(
     mesh: THREE.Mesh,
     position: THREE.Vector3,
@@ -577,6 +580,38 @@ export class ModelPlacer implements Placer {
       position: mesh.position.clone(),
       rotationRad: mesh.rotation.y,
     });
+  }
+
+  /**
+   * Spawn a placement at an exact world pose without arming the tool.
+   * Used by the save store to re-materialize saved placements on region
+   * load.
+   *
+   * Resolves to the new mesh, or null when the entity can't be baked
+   * (unknown id on the current cache build, dev endpoint down). Callers
+   * count nulls and surface them — a missing entity must never abort the
+   * rest of the load.
+   */
+  async spawnAt(opts: SpawnAtOptions): Promise<THREE.Mesh | null> {
+    let baked: CachedEntity;
+    try {
+      baked = await this.getOrFetch(opts.id, opts.animationOverride ?? undefined);
+    } catch (err) {
+      console.warn(`[${this.kind}] spawnAt ${opts.id} failed:`, err);
+      return null;
+    }
+    const placement = this.spawnPlacement(
+      opts.id,
+      baked.name,
+      baked,
+      {
+        position: new THREE.Vector3(opts.position.x, opts.position.y, opts.position.z),
+        rotationRad: opts.rotationY,
+      },
+      opts.plane,
+      opts.notify ?? true,
+    );
+    return placement.mesh;
   }
 
   /** Swap the animation on an existing placement. Re-fetches via the bake
@@ -834,6 +869,8 @@ export class ModelPlacer implements Placer {
     name: string,
     baked: CachedEntity,
     pose: { position: THREE.Vector3; rotationRad: number },
+    plane: number = this.placementPlane,
+    notify = true,
   ): PlacedEntity {
     const { geom, owns } = this.buildGeometryFor(baked, pose);
     const mesh = new THREE.Mesh(geom, this.material);
@@ -851,7 +888,7 @@ export class ModelPlacer implements Placer {
       mesh,
       id,
       name,
-      plane: this.placementPlane,
+      plane,
       cached: baked,
       ownsGeometry: owns,
       animationId: baked.activeAnimationId,
@@ -867,15 +904,17 @@ export class ModelPlacer implements Placer {
     }
     this.placed.push(placement);
     this.onPlacementsChanged?.(this.placed.length);
-    this.onPlacementSpawned?.(
-      mesh,
-      id,
-      name,
-      baked.modelType,
-      baked.sizeX,
-      baked.sizeY,
-      this.placementPlane,
-    );
+    if (notify) {
+      this.onPlacementSpawned?.(
+        mesh,
+        id,
+        name,
+        baked.modelType,
+        baked.sizeX,
+        baked.sizeY,
+        plane,
+      );
+    }
     return placement;
   }
 
